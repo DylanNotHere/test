@@ -1,6 +1,6 @@
 --==================================================
--- VANTA | AUTOFARM v2.2.0
--- Mobs tween to front, others hover above
+-- VANTA | AUTOFARM v2.3.0
+-- Ore/Tree hover below, Mobs hover front, Boss hover above
 --==================================================
 
 local Players = game:GetService("Players")
@@ -27,10 +27,11 @@ local Tab = Window:CreateTab({ name = "Farm" })
 
 local CFG = {
     GlideSpeed = 40,
-    HoverHeight = 12,        -- Default height for Ores/Trees
+    HoverHeight = 12,        -- Default height (unused for mobs/ores now)
     BossHoverHeight = 15,    -- Morten height
-    MobHoverHeight = 6,      -- Height when in front of a mob
-    MobFrontDistance = 4,    -- How many studs in front of the mob to stand
+    MobHoverHeight = 6,      -- Skeleton height
+    MobFrontDistance = 4,    -- How many studs in front of the mob
+    NodeHoverHeight = -5,    -- Ores/Trees height (negative = below)
     SwingRange = 16,
 
     MobSwing = 0.36,
@@ -307,19 +308,20 @@ local function engage(model, isMob)
         startHover(hum, root)
 
         local goal
-        -- If it's a regular skeleton, aim in front of it. Otherwise, aim above it.
         if isMob and not bossNames[model.Name] then
+            -- Skeleton: Tween in front
             local mobRoot = model:FindFirstChild("HumanoidRootPart")
             if mobRoot then
-                -- LookVector points forward. Multiply by negative to go in front.
                 goal = mobRoot.Position + (mobRoot.CFrame.LookVector * CFG.MobFrontDistance) + Vector3.new(0, CFG.MobHoverHeight, 0)
             else
                 goal = targetPos(model, isMob) + Vector3.new(0, CFG.MobHoverHeight, 0)
             end
+        elseif not isMob then
+            -- Ore/Tree: Tween below
+            goal = targetPos(model, isMob) + Vector3.new(0, CFG.NodeHoverHeight, 0)
         else
-            -- Ores, Trees, and Boss hover normally above
-            local hoverHeight = bossNames[model.Name] and CFG.BossHoverHeight or CFG.HoverHeight
-            goal = targetPos(model, isMob) + Vector3.new(0, hoverHeight, 0)
+            -- Boss: Tween above
+            goal = targetPos(model, isMob) + Vector3.new(0, CFG.BossHoverHeight, 0)
         end
 
         local d = goal - hoverCF.Position
