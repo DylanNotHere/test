@@ -27,7 +27,7 @@ local Tab = Window:CreateTab({ name = "Farm" })
 
 local CFG = {
     GlideSpeed = 40,
-    HoverHeight = 12,
+    HoverHeight = 8,
     SwingRange = 16,
 
     MobSwing = 0.36,
