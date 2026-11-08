@@ -1,6 +1,6 @@
 --==================================================
--- VANTA | AUTOFARM v2.0.0
--- Morten Priority + Death Fix
+-- VANTA | AUTOFARM v2.2.0
+-- Mobs tween to front, others hover above
 --==================================================
 
 local Players = game:GetService("Players")
@@ -27,7 +27,10 @@ local Tab = Window:CreateTab({ name = "Farm" })
 
 local CFG = {
     GlideSpeed = 40,
-    HoverHeight = 8,
+    HoverHeight = 12,        -- Default height for Ores/Trees
+    BossHoverHeight = 15,    -- Morten height
+    MobHoverHeight = 6,      -- Height when in front of a mob
+    MobFrontDistance = 4,    -- How many studs in front of the mob to stand
     SwingRange = 16,
 
     MobSwing = 0.36,
@@ -155,7 +158,6 @@ local function getNearestTarget(root)
                 if isAlive(inst, true) then
                     local mobRoot = inst:FindFirstChild("HumanoidRootPart")
                     if mobRoot and mobRoot:IsA("BasePart") then
-                        -- If Morten is alive, return him immediately (overrides everything)
                         return inst, true
                     end
                 end
@@ -297,7 +299,6 @@ local function engage(model, isMob)
 
         local hum, root = getChar()
 
-        -- If dead, stop hovering and return false so farmLoop can wait for respawn
         if not hum then 
             stopHover()
             return false 
@@ -305,7 +306,22 @@ local function engage(model, isMob)
 
         startHover(hum, root)
 
-        local goal = targetPos(model, isMob) + Vector3.new(0, CFG.HoverHeight, 0)
+        local goal
+        -- If it's a regular skeleton, aim in front of it. Otherwise, aim above it.
+        if isMob and not bossNames[model.Name] then
+            local mobRoot = model:FindFirstChild("HumanoidRootPart")
+            if mobRoot then
+                -- LookVector points forward. Multiply by negative to go in front.
+                goal = mobRoot.Position + (mobRoot.CFrame.LookVector * CFG.MobFrontDistance) + Vector3.new(0, CFG.MobHoverHeight, 0)
+            else
+                goal = targetPos(model, isMob) + Vector3.new(0, CFG.MobHoverHeight, 0)
+            end
+        else
+            -- Ores, Trees, and Boss hover normally above
+            local hoverHeight = bossNames[model.Name] and CFG.BossHoverHeight or CFG.HoverHeight
+            goal = targetPos(model, isMob) + Vector3.new(0, hoverHeight, 0)
+        end
+
         local d = goal - hoverCF.Position
         local dt = RunService.Heartbeat:Wait()
 
@@ -338,7 +354,6 @@ local function farmLoop()
         local hum, root = getChar()
 
         if not hum then
-            -- Player is dead. Stop hovering so we don't freeze the respawned character
             stopHover()
             task.wait(1)
         else
