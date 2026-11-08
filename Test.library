@@ -1,249 +1,831 @@
--- slimefarmer_v4.1.0 (Mega Hub: Tween Movement + GoldOre)
-local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
-
-local window = Rayfield:CreateWindow({
-	name = "Mega Hub",
-	loadingTitle = "VANTA",
-	loadingSubtitle = "by dj",
-})
-
-local main = window:CreateTab({ name = "Combat" })
-local resourceTab = window:CreateTab({ name = "Resources" })
-local settingsTab = window:CreateTab({ name = "Settings" })
+-- autobuilder_v4.0.0  (Terrain: rolling hills, thin crust, underside left empty; snake build; + auto break grass)
+-- Turn Auto Builder on, then place ONE Grass Block where the CENTRE of the terrain should be (that is ground level).
+-- From there it builds like a snake: place a block, wait until it really exists, glide to it (at the
+-- berry farm's speed), then place the next block right beside it. Every block always touches one that's
+-- already there, and you're always right next to what you're placing.
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
-
 local player = Players.LocalPlayer
-local Remotes = RS:WaitForChild("Remotes")
+
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+
+-- send both lowercase and Capitalised keys so either UI style works
+local function dual(t)
+	local out = {}
+	for k, v in pairs(t) do
+		out[k] = v
+		out[k:sub(1, 1):upper() .. k:sub(2)] = v
+	end
+	return out
+end
+
+local Window = Rayfield:CreateWindow(dual({
+	name = "VANTA | Terrain Builder",
+	loadingTitle = "VANTA",
+	loadingSubtitle = "Terrain",
+}))
+local Tab = Window:CreateTab(dual({ name = "Builder" }))
 
 local CFG = {
-	GlideSpeed = 45,
-	GlideTimeout = 10,
-	StopDistance = 6,
-	AttackRange = 15,
-	SwingsPerTick = 3,
-	SwingDelay = 0.15,
-	BlockedRadius = 5,
+	PlaceDelay = 0.1,   -- pause after each block (seconds); it slows itself down if the server drops placements
+	MaxDelay = 1.0,     -- slowest it will go
+	CheckTimeout = 3,   -- seconds to wait for a placed block to show up
+	MaxRetries = 4,     -- retries for a block that didn't show up
+	GlideSpeed = 30,    -- studs per second while following the build (same as the berry farm)
+	HoverHeight = 4,    -- studs above the block you hover while placing next to it
+	TerrainSize = 2,    -- 1 Small (~3k blocks), 2 Medium (~5k), 3 Large (~6.8k)
+	BreakRange = 15,    -- Auto Break Grass: GrassBlocks within this many studs of you get swung at
+	SwingDelay = 0.2,   -- seconds between swings (the Iron Pickaxe's gather cooldown is about 0.2)
 }
 
-local blockedSpots = {
-	Vector3.new(8, 196, -80),
-	Vector3.new(24, 192, -112),
-	Vector3.new(9, -198.5, 0),
+local FIXED_NORMAL = Vector3.new(-1, 0, 0)
+local KEY_PATTERN = "^(-?%d+),(-?%d+),(-?%d+)$"
+local DIRS = {
+	{ 1, 0, 0 }, { -1, 0, 0 },
+	{ 0, 1, 0 }, { 0, -1, 0 },
+	{ 0, 0, 1 }, { 0, 0, -1 },
 }
+local HORIZONTAL = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }
 
-local state = { 
-    WalkToTarget = false, 
-    AutoAttack = false,
-    AutoMobs = false,
-    AutoOres = false,
-    AutoTrees = false
-}
-
--- ===== Target Cache =====
-local validMobs = { ["Slime"] = true, ["Skeleton"] = true, ["SkeletonArcher"] = true }
-local validOres = { ["Coal"] = true, ["IronOre"] = true, ["GoldOre"] = true }
-local validTrees = { ["Pine"] = true }
-
-local targets = {} -- [Model] = true
-
-local function track(inst)
-    if inst:IsA("Model") then
-        if (validMobs[inst.Name] and state.AutoMobs) or 
-           (validOres[inst.Name] and state.AutoOres) or 
-           (validTrees[inst.Name] and state.AutoTrees) then
-            targets[inst] = true
-        end
-    end
+local function fmt(x, y, z)
+	return string.format("%d,%d,%d", x, y, z)
 end
 
-for _, v in ipairs(workspace:GetDescendants()) do track(v) end
-workspace.DescendantAdded:Connect(track)
-workspace.DescendantRemoving:Connect(function(inst) targets[inst] = nil end)
-
-local function isBlocked(pos)
-	for _, blocked in ipairs(blockedSpots) do
-		if (pos - blocked).Magnitude < CFG.BlockedRadius then return true end
-	end
-	return false
+local function notify(title, content)
+	pcall(function()
+		Rayfield:Notify(dual({ title = title, content = content, duration = 4 }))
+	end)
 end
 
-local function nearestTarget(fromPos)
-	local best, bestDist = nil, math.huge
-	for target in pairs(targets) do
-		if target.Parent then
-            local isAlive = true
-            local hum = target:FindFirstChildOfClass("Humanoid")
-            if hum and hum.Health <= 0 then isAlive = false end
-            
-            if isAlive then
-                local pos = target:GetPivot().Position
-                local d = (pos - fromPos).Magnitude
-                if d < bestDist and not isBlocked(pos) then
-                    best, bestDist = target, d
-                end
-            end
+-- ===== terrain blueprints: rolling hills, a thin crust, underside left empty =====
+-- Three sizes (Terrain Size slider): Small ~3k blocks, Medium ~5k, Large ~6.8k.
+-- Grass on top, one dirt layer under it, and a short stone skirt around the rim so the edge looks like a cliff.
+-- Neighbouring columns never differ by more than 1 in height, so every block touches the one before it.
+-- Each layer is a list of rows (top row = +Z); a row is run-length encoded: "5.3G" = 5 empty, 3 grass.
+-- The seed is the centre of the terrain at ground level. G grass | D dirt | S stone
+local TERRAINS = {
+	{
+		name = "Small", c0 = 22, r0 = 17, top = 6,
+		layers = {
+			{ -- y = seed + 6
+				"44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "21.6G17.", "20.8G16.", "20.8G16.",
+			},
+			{ -- y = seed + 5
+				"44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "21.5G18.", "19.9G16.", "19.2G6D2G15.", "18.2G8D2G14.", "18.2G8D16.",
+			},
+			{ -- y = seed + 4
+				"44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "27.1G16.", "26.2G16.", "44.", "44.", "44.", "44.", "19.8G17.", "18.10G16.", "17.4G5D3G15.", "17.2G9D2G14.", "17.2G2D6.2D2G13.", "17.1G2D8.2D14.", "17.1G10D16.",
+			},
+			{ -- y = seed + 3
+				"44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "26.3G15.", "25.5G14.", "20.7G1D3G13.", "18.8G2D3G13.", "17.13G14.", "17.12G15.", "16.13G15.", "16.13G15.", "16.3G8D2G15.", "16.2G10D2G14.", "16.1G4D5.3D2G13.", "15.2G2D9.2D1G13.", "15.2G2D10.2D1G12.", "15.2G1D10.2D14.", "16.1G3D8S16.",
+			},
+			{ -- y = seed + 2
+				"44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "7.5G29.2G1.", "6.11G23.3G1.", "6.12G23.3G", "6.12G23.3G", "7.11G25.1G", "12.6G25.1G", "13.5G26.", "14.4G26.", "14.4G26.", "14.4G26.", "14.4G26.", "12.5G9.3G15.", "6.9G10.6G13.", "4.11G1.10G3D3G12.", "3.22G5D4G10.", "3.17G7D1.3D3G10.", "3.15G8D2.3D2G11.", "3.3G6.5G13D2G12.", "14.3G12D2G13.", "14.2G13D2G13.", "14.2G13D2G13.", "14.2G3D8.2D2G13.", "14.2G2D10.2D1G13.", "14.2G1D12.2D1G12.", "14.1G2D13.1D2G11.", "14.1G2D13.2D12.", "14.1G2D11.2S14.", "16.2D10S16.",
+			},
+			{ -- y = seed + 1
+				"44.", "44.", "44.", "44.", "44.", "44.", "4.2G35.1G2.", "3.6G30.3G2.", "3.11G22.7G1.", "2.5G5D6G15.8G2D1.", "2.4G11D2G13.8G3D1.", "1.5G12D1G13.9G3D", "3.3G12D2G13.8G3D", "5.2G11D2G14.1G6.2G1D", "6.6G6D2G22.1G1D", "7.6G5D2G7.1G15.1G", "8.6G4D2G6.4G13.1G", "11.3G4D2G6.4G13.1G", "8.6G4D2G5.6G12.1G", "7.7G4D3G3.7G12.1G", "5.7G5D9G3D4G10.1G", "3.3G9D10G6D4G7.1G1.", "2.2G11D1G10D3.3D5G4.2G1.", "1.2G22D5.4D4G3.2G1.", "1.2G17D11.3D5G1.2G2.", "1.2G15D13.2D9G2.", "2.1G3D6G5D13.2D5G2.2G3.", "2.12G3D12.2D3G5.2G3.", "3.4G4.3G2D13.2D2G6.1G4.", "4.2G6.2G2D13.2D2G11.", "4.2G6.2G2D13.2D2G11.", "12.2G2D14.1D2G11.", "12.2G2D15.1D2G10.", "12.2G1D16.2D1G10.", "12.2G1D15.1S1D12.", "12.2G2D12.2S14.", "16.1D3S24.",
+			},
+			{ -- y = seed + 0
+				"15.4G13.1G11.", "14.2G16.4G8.", "33.5G6.", "8.1G12.3G11.4G5.", "6.3G12.3G12.4G4.", "5.5G11.3G13.4G3.", "4.2D6G9.3G11.6G1D2.", "3.6D5G7.3G9.6G3D2.", "3.11D7G11.4G7D1.", "2.5D5.6D3G10.2G8D1.1D1.", "2.4D11.2D2G9.2G8D2.1D1.", "1.5D12.1D2G9.2G9D2.1D", "1.2G3D12.2D8G1.4G8D2.1D", "5G2D11.2D14G1D6G3D", "3.3G6D6.2D18G2.2G2D", "5.2G6D5.2D7G1D8G6.1G1D", "6.2G6D4.2D6G4D5G7.1G1D", "6.5G3D4.2D6G4D4G8.1G1D", "5.3G6D4.2D5G6D4G7.1G1D", "4.3G7D4.3D3G7D5G6.1G1D", "1.4G7D5.9D3.4D4G4.2G1D", "3G3D9.10D6.4D7G1D1.", "2G2D11.1D16.5D4G2D1.", "1.2D31.4D3G2D1.", "1.2D31.5D1G2D2.", "1.2D30.9D2.", "2.1D3.6D20.5D2G2D3.", "2.12D17.3D5G2D3.", "3.4D4G3D17.2D6G1D4.", "4.2D6G2D17.2D6G5.", "4.2D6G2D17.2D5G6.", "6.6G2D17.2D4G7.", "7.5G2D18.2D1G9.", "8.1G1.2G2D18.2D10.", "10.2G2D16.2S12.", "12.3D1S28.", "16.2S26.",
+			},
+			{ -- y = seed - 1
+				"15.4D7G3.3G1D11.", "11.3G2D10G4.2G4D8.", "9.17G5.2G5D6.", "8.1D5G5.2G3D2G5.4G4D5.", "6.3D4G6.2G3D2G6.4G4D4.", "5.5D4G5.2G3D2G6.5G4D3.", "4.1D1.6D3G3.3G3D2G5.4G7D2.", "3.1D5.5D7G3D2G4.3G6D2.1D2.", "3.1D10.7D11G4D6.1D1.", "2.1D15.3D10G2D9.1S1.", "2.1D16.2D9G2D10.1S1.", "1.1D17.2D9G2D11.1S", "1.2D17.8D1G4D10.1S", "5D15.14D1.6D2.1S", "3G3D14.18D2G2D1.1S", "5G2D13.7D1.8D6G2D", "6G2D12.6D4.5D3G3.1G2D", "2G1.3G5D9.6D4.4D3G4.1G2D", "5G3D12.5D6.4D3G3.1G2D", "4G3D14.3D7.5D3G1.2G2D", "1G4D28.4D4G3D", "3D32.8D1.", "2D35.4D1.1D1.", "1.1D36.3D1.1D1.", "1.1D37.1D1.1D2.", "1.1D39.1D2.", "2.1D34.2D1.1D3.", "2.1D31.5D1.1D3.", "3.1D3.4D22.7D4.", "4.1D1.6D21.6D5.", "4.8D21.5D6.", "6.6D21.4D7.", "7.5D22.1D9.", "8.1D1G2D20.1S1D10.", "10.2D19.1S12.", "12.2D2S28.", "16.1S27.",
+			},
+			{ -- y = seed - 2
+				"15.11D3G4D11.", "11.4D1.10D4G2D1.3D8.", "9.17D5G2D3.2D6.", "8.6D5G2D3.2D5G4D3.1D5.", "6.2D1.4D6G2D3.2D6G4D3.1D4.", "5.1D4.4D5G2D3.2D6G5D3.1D3.", "4.1S7.3D3G3D3.2D5G4D6.1S2.", "3.1S10.7D3.2D4G3D8.1S2.", "3.1S17.11D10.1S1.", "2.1S18.10D11.1S1.", "2.1S18.9D12.1S1.", "1.1S19.9D13.1S", "1.1D26.1D14.1S", "1D42.1S", "3D35.2D3.1S", "5D31.6D1.1S", "6D29.3D3G1D1.1S", "2D1G3D28.3D4G1D1.1S", "5D30.3D3G1D1.1S", "4D32.3D1G2D1.1S", "1D36.4D2.1S", "1D41.1S1.", "1D41.1S1.", "1.1S40.1S1.", "1.1S39.1S2.", "1.1S39.1S2.", "2.1S37.1S3.", "2.1S37.1S3.", "3.1S35.1S4.", "4.1S33.1D5.", "4.2S31.1D6.", "6.1D28.2D7.", "7.1D26.1D9.", "8.2D22.2S10.", "10.2D32.", "12.3S29.", "44.",
+			},
+			{ -- y = seed - 3
+				"15.4S13D1S11.", "11.3D1S11.4D3.3S8.", "9.2D15.5D5.2S6.", "8.1S5.5D7.5D7.1S5.", "6.2S5.6D7.6D7.1S4.", "5.1S8.5D7.6D8.1S3.", "4.1S10.3D8.5D10.1S2.", "3.1S22.4D11.1S2.", "3.1S38.1S1.", "2.1S41.", "2.1S41.", "1.1S42.", "1.1S42.", "1S43.", "1D43.", "1D42.1S", "1D37.3D2.1S", "1D1.1D34.4D2.1S", "1D37.3D2.1S", "1D38.1D3.1S", "1D42.1S", "1S41.1S1.", "1S41.1S1.", "1.1S40.1S1.", "1.1S39.1S2.", "1.1S39.1S2.", "2.1S37.1S3.", "2.1S37.1S3.", "3.1S35.1S4.", "4.1S33.1S5.", "4.2S31.1S6.", "6.1S28.2S7.", "7.1S26.1S9.", "8.1S1D23.1S10.", "10.2S32.", "12.2S30.", "44.",
+			},
+			{ -- y = seed - 4
+				"15.11S3D4S11.", "11.4S18.3S8.", "9.2S25.2S6.", "8.1S29.1S5.", "6.2S31.1S4.", "5.1S34.1S3.", "44.", "44.", "44.", "44.", "44.", "44.", "1.1S42.", "1S43.", "1S43.", "1S43.", "1S43.", "1S43.", "1S43.", "1S43.", "1S43.", "1S43.", "1S43.", "44.", "44.", "44.", "44.", "44.", "44.", "38.1S5.", "37.1S6.", "6.1S28.2S7.", "7.1S26.1S9.", "8.2S34.", "10.2S32.", "44.", "44.",
+			},
+			{ -- y = seed - 5
+				"19.13S12.", "11.3S30.", "9.2S33.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "1S43.", "1S43.", "1S43.", "1S43.", "1S43.", "1S43.", "1S43.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "9.1S34.", "44.", "44.", "44.",
+			},
+			{ -- y = seed - 6
+				"26.3S15.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.", "44.",
+			},
+		},
+	},
+	{
+		name = "Medium", c0 = 29, r0 = 23, top = 6,
+		layers = {
+			{ -- y = seed + 6
+				"57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "28.7G22.", "27.9G21.", "26.11G20.", "26.10G21.", "27.4G26.",
+			},
+			{ -- y = seed + 5
+				"57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "26.9G22.", "25.12G20.", "25.3G7D3G19.", "24.3G9D3G18.", "24.2G11D2G18.", "24.2G10D21.", "27.4D26.",
+			},
+			{ -- y = seed + 4
+				"57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "34.3G20.", "34.2G21.", "57.", "57.", "57.", "57.", "26.6G25.", "24.11G22.", "24.12G21.", "23.14G20.", "23.3G9D3G19.", "22.3G12D2G18.", "22.3G3D7.3D2G17.", "22.2G3D9.3D2G16.", "22.2G2D10.3D18.", "22.2G3D4.5D21.", "27.4D26.",
+			},
+			{ -- y = seed + 3
+				"57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "34.5G18.", "32.8G17.", "27.14G16.", "24.10G3D3G17.", "23.11G2D4G17.", "22.17G18.", "22.17G18.", "22.16G19.", "21.17G19.", "21.5G6D6G19.", "21.3G11D3G19.", "21.3G12D3G18.", "21.2G14D3G17.", "20.3G3D9.3D2G17.", "20.2G3D12.2D2G16.", "20.2G3D13.2D2G15.", "20.2G2D15.2D16.", "20.2G2D12.1S2D18.", "21.1G4D1S4.5S21.", "27.4S26.",
+			},
+			{ -- y = seed + 2
+				"57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "55.1G1.", "9.10G35.3G", "8.14G31.4G", "8.15G30.4G", "8.15G31.3G", "9.15G31.2G", "10.14G32.1G", "15.9G33.", "17.7G33.", "18.5G34.", "18.5G34.", "18.5G34.", "18.5G34.", "18.5G34.", "18.5G34.", "15.8G11.4G19.", "8.12G13.7G17.", "6.14G2.2G7.11G15.", "4.30G5D4G14.", "4.28G8D4G13.", "4.23G14D4G12.", "4.20G10D3.3D4G13.", "4.19G11D2.4D3G14.", "5.3G9.5G17D3G15.", "18.4G17D2G16.", "19.3G16D3G16.", "19.2G17D2G17.", "19.2G5D6.6D2G17.", "19.2G3D11.3D2G17.", "18.3G3D12.3D2G16.", "18.3G2D14.3D2G15.", "18.2G3D15.2D2G15.", "18.2G2D17.2D2G14.", "18.2G2D18.2D1G14.", "18.2G2D17.2D16.", "18.2G2D14.3S18.", "21.3D3S4.5S21.", "27.4S26.",
+			},
+			{ -- y = seed + 1
+				"57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "6.1G50.", "5.3G45.2G2.", "4.8G39.5G1.", "4.13G32.7G1.", "3.19G22.11G1D1.", "3.6G10D5G19.11G3D", "2.6G14D3G17.11G4D", "2.6G15D2G17.11G4D", "3.5G15D3G17.11G3D", "5.4G15D2G17.6G2.4G2D", "6.4G14D2G28.2G1D", "8.7G9D2G29.2G", "9.8G7D2G30.1G", "10.8G5D3G8.4G18.1G", "12.6G5D3G8.5G17.1G", "14.4G5D3G7.6G17.1G", "12.6G5D4G6.7G16.1G", "10.8G5D4G5.9G15.1G", "8.10G5D5G3.11G14.1G", "6.9G8D11G4D5G13.1G", "4.4G12D13G7D6G9.2G", "3.3G14D2G2D7G11D6G7.2G", "2.2G30D5.4D6G5.2G1.", "2.2G28D8.4D6G3.3G1.", "1.3G23D14.4D6G2.3G1.", "2.2G20D16.4D11G2.", "2.2G19D17.3D12G2.", "2.3G3D9G5D17.3D5G4.3G3.", "3.15G4D17.2D4G6.2G4.", "4.6G5.4G3D16.3D2G8.2G4.", "4.5G7.3G2D17.2D3G8.1G5.", "5.3G8.3G2D17.2D3G14.", "6.2G8.3G2D17.2D3G14.", "7.2G7.2G3D18.2D2G14.", "8.1G7.2G3D19.2D2G13.", "16.2G2D20.2D3G12.", "16.2G2D21.2D1G13.", "16.2G2D21.2D14.", "16.2G2D19.2S16.", "17.1G3D16.2S18.", "21.1D4S31.", "57.",
+			},
+			{ -- y = seed + 0
+				"23.2G32.", "18.6G18.3G12.", "18.3G21.5G10.", "43.6G8.", "28.3G13.7G6.", "9.3G16.3G15.6G5.", "8.4G15.5G15.6G4.", "7.5G15.5G16.6G3.", "6.1D7G13.5G15.8G2.", "5.3D8G11.5G13.8G2D2.", "4.8D7G8.4G12.8G5D1.", "4.13D13G12.7G7D1.", "3.19D5G14.3G12D1.", "3.6D10.5D3G13.3G11D2.1D", "2.6D14.3D3G12.2G11D3.1D", "2.6D15.2D3G11.3G11D3.1D", "1.2G5D15.3D3G10.4G11D2.1D", "1.4G4D15.2D17G6D2G4D1.1D", "1.5G4D14.2D28G3D", "3.5G7D9.2D24G2.3G2D", "6.3G8D7.2D22G6.2G1D", "7.3G8D5.3D8G4D9G8.1G1D", "8.4G6D5.3D8G5D6G10.1G1D", "8.6G4D5.3D7G6D5G11.1G1D", "7.5G6D5.4D6G7D5G10.1G1D", "6.4G8D5.4D5G9D6G8.1G1D", "5.3G10D5.5D3G11D6G7.1G1D", "1.5G9D8.11D4.5D6G5.2G1D", "4G4D12.13D7.6D5G1.3G2D", "1.2G3D14.2D2.7D11.6D7G2D", "1.1G2D39.6D5G2D1.", "1.1G2D40.6D3G3D1.", "1.3D41.6D2G3D1.", "2.2D40.11D2.", "2.2D39.12D2.", "2.3D3.9D25.5D4G3D3.", "3.15D23.4D6G2D4.", "4.6D5G4D22.2D8G2D4.", "4.5D7G3D21.3D8G1D5.", "5.3D8G3D21.3D8G6.", "6.2D8G3D21.3D7G7.", "7.2D7G2D23.2D5G9.", "8.1D7G2D24.2D3G10.", "9.3G1.3G2D24.3D1G11.", "11.1G1.3G2D25.1D13.", "13.3G2D23.1S1D14.", "15.1G2D21.2S16.", "17.3D1S36.", "21.3S33.", "57.",
+			},
+			{ -- y = seed - 1
+				"23.2D8G5.2G17.", "18.6D10G4.4G3D12.", "15.3G3D13G5.3G5D10.", "13.21G6.3G6D8.", "11.9G4.4G3D3G6.4G7D6.", "9.3D6G7.3G3D3G7.5G6D5.", "8.4D6G7.2G5D2G8.5G6D4.", "7.5D6G7.2G5D2G8.6G6D3.", "6.8D5G6.2G5D2G7.6G8D2.", "5.1D2.8D5G2.4G5D2G7.4G8D1.1D2.", "4.1D7.7D8G4D4G5.3G8D4.1D1.", "4.1D12.13D6G2.4G7D6.1D1.", "3.1D18.5D14G3D11.1S1.", "3.1D20.3D13G3D13.1S", "2.1D22.3D12G2D14.1S", "2.1D22.3D11G3D14.1S", "1.2D23.3D10G4D13.1S", "1.4D21.17D6.2D5.1S", "1.5D20.28D2.1S", "3G5D18.24D2G3D1.1D", "6G3D17.22D6G3D", "7G3D16.8D4.9D3G3.2G2D", "8G4D14.8D5.6D4G5.1G2D", "3G2.3G6D12.7D6.5D5G5.1G2D", "7G5D15.6D7.5D4G5.1G2D", "6G4D17.5D9.6D3G3.2G2D", "5G3D20.3D11.6D7G2D", "1G5D37.6D5G3D", "4D42.5D1G3D1.1D", "1.2D45.7D1.1D", "1.1D47.5D1.1D1.", "1.1D48.3D2.1D1.", "1.1D49.2D2.1D1.", "2.1D51.1D2.", "2.1D51.1D2.", "2.1D44.4D2.1D3.", "3.1D41.6D1.1D4.", "4.1D5.5D28.8D1.1D4.", "4.1D4.7D27.9D5.", "5.1D2.8D27.8D6.", "6.1D1.8D27.7D7.", "7.1D1.7D27.5D9.", "8.8D28.3D10.", "9.3D1G3D28.2D11.", "11.1D1G3D27.1D13.", "13.3D25.2S14.", "15.2D40.", "17.1D3S36.", "21.1S35.", "57.",
+			},
+			{ -- y = seed - 2
+				"23.10D5G2D17.", "18.5D1.10D4G7D12.", "15.3D3.13D5G3D3.2D10.", "13.21D6G3D4.2D8.", "11.9D4G4D3.3D6G4D5.2D6.", "9.2D1.6D7G3D3.3D7G5D5.1D5.", "8.1D3.6D7G2D5.2D8G5D5.1D4.", "7.1D4.6D7G2D5.2D8G6D5.1D3.", "6.1S7.5D6G2D5.2D7G6D7.1D2.", "5.1S10.5D2G4D5.2D7G4D9.1S2.", "4.1S14.8D4.4D5G3D12.1S1.", "4.1S25.6D2G4D13.1S1.", "3.1S23.14D14.1S1.", "3.1S23.13D16.1S", "2.1S25.12D16.1S", "2.1S25.11D17.1S", "1.1D27.10D17.1S", "1.1D54.1S", "1.1D54.1S", "3D47.2D4.1S", "6D42.6D2.1S", "7D40.3D3G2D1.1S", "8D37.4D5G1D1.1S", "3D2G3D36.5D5G1D1.1S", "7D38.4D5G1D1.1S", "6D41.3D3G2D1.1S", "5D43.7D1.1S", "1D48.5D2.1S", "1D50.1D4.1S", "1.1D54.1S", "1.1D53.1S1.", "1.1D53.1S1.", "1.1S53.1S1.", "2.1S51.1S2.", "2.1S51.1S2.", "2.1S50.1S3.", "3.1S48.1S4.", "4.1S47.1S4.", "4.1S46.1S5.", "5.1S44.1D6.", "6.1S41.2D7.", "7.1S39.1D9.", "8.1S37.1D10.", "9.2D1.1D31.1S1D11.", "11.2D30.1S13.", "13.2D27.1S14.", "15.1D1S40.", "17.3S37.", "57.", "57.",
+			},
+			{ -- y = seed - 3
+				"23.2S15D17.", "18.5S11.4D2.2D3S12.", "15.3D16.5D6.2S10.", "13.2D19.6D7.2S8.", "11.2D7.4D10.6D9.2S6.", "9.2S7.7D9.7D10.1S5.", "8.1S9.7D9.8D10.1S4.", "7.1S10.7D9.8D11.1S3.", "6.1S12.6D9.7D13.1S2.", "5.1S15.2D11.7D13.1S2.", "4.1S30.5D15.1S1.", "4.1S31.2D17.1S1.", "3.1S53.", "3.1S53.", "2.1S54.", "2.1S54.", "1.1S55.", "1.1S55.", "1.1S55.", "1D55.1S", "1D55.1S", "1D49.3D3.1S", "1D48.5D2.1S", "1D2.2D44.5D2.1S", "1D48.5D2.1S", "1D49.3D3.1S", "1D55.1S", "1D55.1S", "1S55.1S", "1.1S54.1S", "1.1S53.1S1.", "1.1S53.1S1.", "1.1S53.1S1.", "2.1S51.1S2.", "2.1S51.1S2.", "2.1S50.1S3.", "3.1S48.1S4.", "4.1S47.1S4.", "4.1S46.1S5.", "5.1S44.1S6.", "6.1S41.2S7.", "7.1S39.1S9.", "8.1S37.1S10.", "9.2S33.2S11.", "11.1S1D30.1S13.", "13.2S42.", "15.2S40.", "17.1S39.", "57.", "57.",
+			},
+			{ -- y = seed - 4
+				"23.10S5D2S17.", "18.5S17.5S12.", "15.3S27.2S10.", "13.2S32.2S8.", "11.2S36.2S6.", "9.2S40.1S5.", "8.1S43.1S4.", "7.1S45.1S3.", "54.1S2.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "1.1S55.", "1.1S55.", "1.1S55.", "1S56.", "1S56.", "1S56.", "1S56.", "1S56.", "1S56.", "1S56.", "1S56.", "1S56.", "1S56.", "1.1S55.", "1.1S55.", "1.1S55.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "50.1S6.", "48.2S7.", "47.1S9.", "46.1S10.", "9.2S34.1S11.", "11.2S44.", "13.2S42.", "15.1S41.", "57.", "57.", "57.",
+			},
+			{ -- y = seed - 5
+				"25.15S17.", "40.2S15.", "15.3S39.", "13.2S42.", "11.2S44.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "1S56.", "1S56.", "1S56.", "1S56.", "1S56.", "1S56.", "1S56.", "1S56.", "1S56.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "12.1S44.", "57.", "57.", "57.", "57.", "57.",
+			},
+			{ -- y = seed - 6
+				"33.5S19.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.", "57.",
+			},
+		},
+	},
+	{
+		name = "Large", c0 = 34, r0 = 27, top = 6,
+		layers = {
+			{ -- y = seed + 6
+				"67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "34.3G30.", "32.9G26.", "31.12G24.", "31.12G24.", "31.11G25.", "30.8G29.",
+			},
+			{ -- y = seed + 5
+				"67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "31.10G26.", "30.13G24.", "29.5G3D7G23.", "29.3G9D4G22.", "28.3G12D2G22.", "28.3G12D2G22.", "28.3G11D25.", "30.8D29.",
+			},
+			{ -- y = seed + 4
+				"67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "41.2G24.", "40.3G24.", "40.2G25.", "67.", "67.", "67.", "67.", "67.", "30.9G28.", "28.13G26.", "28.14G25.", "27.16G24.", "27.4G10D3G23.", "26.4G13D2G22.", "26.3G5D3.7D2G21.", "26.3G3D9.4D2G20.", "26.2G3D12.2D2G20.", "26.2G3D11.3D22.", "25.3G3D7.4D25.", "30.8D29.",
+			},
+			{ -- y = seed + 3
+				"67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "40.5G22.", "38.8G21.", "36.11G20.", "30.11G2D4G20.", "28.12G3D4G20.", "27.13G2D4G21.", "26.20G21.", "26.19G22.", "25.20G22.", "25.19G23.", "25.19G23.", "25.5G9D5G23.", "24.4G13D4G22.", "24.4G14D3G22.", "24.3G16D3G21.", "24.3G4D10.3D3G20.", "24.2G4D13.2D3G19.", "24.2G3D15.2D2G19.", "23.3G3D16.2D2G18.", "23.3G2D17.2D20.", "23.3G2D14.1S2D22.", "24.1G5D8.4S25.", "30.8S29.",
+			},
+			{ -- y = seed + 2
+				"67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "64.2G1.", "11.9G43.3G1.", "10.15G37.4G1.", "9.18G35.5G", "9.18G35.5G", "10.17G36.4G", "10.18G36.3G", "12.16G37.2G", "14.14G38.1G", "19.9G38.1G", "20.8G39.", "21.6G40.", "21.6G40.", "22.5G40.", "22.5G40.", "21.6G40.", "21.6G40.", "21.6G15.1G24.", "12.14G14.5G22.", "9.15G14.9G20.", "7.16G3.3G7.13G18.", "5.19G1.15G5D5G17.", "5.33G8D6G15.", "4.32G11D5G15.", "4.26G11D2.4D5G15.", "5.23G12D3.4D4G16.", "5.22G13D2.4D4G17.", "6.3G10.7G20D3G18.", "21.5G19D3G19.", "22.3G20D3G19.", "22.3G19D3G20.", "22.3G19D3G20.", "22.3G5D9.5D3G20.", "22.2G4D13.4D2G20.", "22.2G4D14.3D3G19.", "22.2G3D16.3D3G18.", "21.3G3D17.3D2G18.", "21.3G2D19.3D2G17.", "21.3G2D20.2D3G16.", "21.2G3D21.2D18.", "21.2G3D19.2D20.", "21.2G3D16.3S22.", "24.4D2S8.4S25.", "30.8S29.",
+			},
+			{ -- y = seed + 1
+				"67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "8.1G58.", "7.2G54.1G3.", "6.4G51.4G2.", "5.10G45.5G2.", "5.15G37.8G2.", "4.21G27.12G2D1.", "3.8G9D8G22.13G3D1.", "3.7G15D4G21.12G4D1.", "2.7G18D3G20.12G5D", "3.6G18D3G20.12G5D", "4.6G17D3G20.13G4D", "6.4G18D2G21.6G2.5G3D", "7.5G16D3G31.3G2D", "9.5G14D3G33.2G1D", "10.9G9D3G34.1G1D", "11.9G8D3G10.3G21.2G", "12.9G6D4G9.5G21.1G", "14.7G6D4G8.7G20.1G", "17.5G5D4G8.7G20.1G", "14.8G5D4G8.7G20.1G", "12.9G6D4G7.9G19.1G", "11.10G6D5G5.11G18.1G", "9.12G6D7G1.7G1D6G16.2G", "7.5G14D14G5D6G14.2G", "4.5G15D14G9D7G10.2G1.", "3.4G16D3G3D7G13D7G8.2G1.", "2.3G19D1G15D5.5D7G6.3G1.", "2.3G33D8.6D6G4.4G1.", "2.2G32D11.5D7G3.3G2.", "2.2G26D17.5D8G1.4G2.", "2.3G23D19.4D13G3.", "2.3G22D19.4D14G3.", "3.3G3D10G7D20.3D6G4.4G4.", "3.18G5D19.3D4G7.3G5.", "4.8G4.6G3D20.3D3G9.2G5.", "5.6G7.4G3D19.3D3G10.1G6.", "5.5G9.3G3D19.3D3G17.", "6.4G9.3G3D19.3D3G17.", "7.3G9.3G2D21.2D3G17.", "8.2G9.3G2D21.3D3G16.", "19.3G2D22.3D2G16.", "19.2G3D23.2D3G15.", "19.2G3D24.2D2G15.", "19.2G3D24.3D16.", "19.2G2D24.2D18.", "19.2G2D22.2S20.", "21.3D19.2S22.", "24.1D5S37.", "67.",
+			},
+			{ -- y = seed + 0
+				"67.", "23.6G20.1G17.", "20.7G22.5G13.", "50.6G11.", "51.7G9.", "33.3G16.7G8.", "11.3G18.4G18.7G6.", "10.4G18.5G18.7G5.", "9.5G18.5G19.7G4.", "8.1D6G17.5G19.7G4.", "7.2D9G14.5G17.9G1D3.", "6.4D10G12.5G15.9G4D2.", "5.10D8G9.4G14.10G5D2.", "5.15D15G14.8G8D2.", "4.21D7G16.4G12D1.1D1.", "3.8D9.8D4G15.3G13D2.1D1.", "3.7D15.4D3G15.3G12D3.1D1.", "2.7D18.3D2G14.4G12D4.1D", "2.1G6D18.3D3G13.4G12D4.1D", "2.2G6D17.3D4G12.4G13D3.1D", "1.5G4D18.2D21G6D2G5D2.1D", "1.6G5D16.3D31G3D1.1D", "2.7G5D14.3D33G3D", "6.4G9D9.3D26G5.3G2D", "7.4G9D8.3D10G3D11G9.1G2D", "8.4G9D6.4D9G5D9G10.2G1D", "9.5G7D6.4D8G7D6G13.1G1D", "9.8G5D5.4D8G7D6G13.1G1D", "9.5G8D5.4D8G7D6G13.1G1D", "8.4G9D6.4D7G9D7G11.1G1D", "7.4G10D6.5D5G11D7G9.2G1D", "4.5G12D6.7D1G7D1.6D7G8.1G2D", "1.6G5D14.14D5.6D6G6.2G2D", "1.3G5D15.14D9.7D10G2D1.", "1.2G4D16.3D3.7D13.7D8G2D1.", "1.1G3D19.1D25.7D6G3D1.", "1.1G3D47.6D4G4D1.", "1.1G2D48.7D3G3D2.", "2.2D48.8D1G4D2.", "2.3D46.13D3.", "2.3D45.14D3.", "3.3D3.10D30.6D4G4D4.", "3.18D27.4D7G3D5.", "4.8D4G6D26.3D9G2D5.", "5.6D7G4D25.3D10G1D6.", "5.5D9G3D25.3D10G7.", "6.4D9G3D25.3D9G8.", "7.3D9G3D25.3D8G9.", "8.2D9G3D26.3D5G11.", "10.9G3D27.2D4G12.", "11.3G1.4G2D28.3D2G13.", "12.2G1.4G2D29.2D15.", "15.4G2D28.2D16.", "16.3G2D26.2S18.", "18.1G2D24.2S20.", "21.2D1S43.", "24.4S39.", "67.",
+			},
+			{ -- y = seed - 1
+				"31.8G28.", "23.6D10G5.5G1D17.", "19.1G7D12G6.4G5D13.", "17.22G7.4G6D11.", "14.25G8.4G7D9.", "13.10G6.4G3D3G8.5G7D8.", "11.3D7G8.3G4D3G9.6G7D6.", "10.4D7G8.3G5D2G9.7G7D5.", "9.5D7G8.3G5D3G9.7G7D4.", "8.7D6G8.3G5D3G9.7G7D4.", "7.1D1.9D5G6.3G5D3G8.6G10D3.", "6.1D3.10D12G5D3G7.5G9D3.1D2.", "5.1D9.8D9G4D5G5.4G10D4.1D2.", "5.1D14.15D7G3.4G8D7.1D2.", "4.1D20.7D16G4D13.1S1.", "3.1D24.4D15G3D15.1S1.", "3.1D25.3D15G3D15.1S1.", "2.1D27.2D14G4D16.1S", "2.1D27.3D13G4D16.1S", "2.2D26.4D12G4D16.1S", "1.5D24.21D6.2D7.1S", "1.6D24.31D4.1S", "1.1G7D22.33D2.1S", "1.5G4D21.26D5G3D1.1S", "7G4D20.10D3.11D9G1D1.1D", "8G4D19.9D5.9D4G4.2G3D", "9G5D17.8D7.6D5G6.2G2D", "4G1.4G8D14.8D7.6D5G6.2G2D", "9G5D17.8D7.6D5G6.2G2D", "8G4D19.7D9.7D4G4.3G2D", "7G4D21.5D11.7D5G1.3G3D", "4G5D25.1D14.7D8G1D1.1D", "1G6D44.6D6G2D1.1D", "1.3D50.10D1.1D1.", "1.2D53.8D1.1D1.", "1.1D55.6D2.1D1.", "1.1D56.4D3.1D1.", "1.1D57.3D2.1D2.", "2.1D57.1D3.1D2.", "2.1D60.1D3.", "2.1D60.1D3.", "3.1D51.4D3.1D4.", "3.1D48.7D2.1D5.", "4.1D7.4D35.9D1.1D5.", "5.1D5.7D32.11D6.", "5.1D4.9D31.10D7.", "6.1D3.9D31.9D8.", "7.1D2.9D31.8D9.", "8.11D32.5D11.", "10.9D32.4D12.", "11.3D1G4D33.2D13.", "12.2D1G4D32.1D15.", "14.1G4D30.2S16.", "16.3D28.2S18.", "18.3D46.", "21.3S43.", "24.1S42.", "67.",
+			},
+			{ -- y = seed - 2
+				"31.8D3G25.", "23.16D5G6D17.", "19.4D4.12D6G4D1.4D13.", "17.22D7G4D4.2D11.", "14.25D8G4D5.2D9.", "13.10D6G4D3.3D8G5D6.1D8.", "11.2D1.7D8G3D4.3D9G6D5.2D6.", "10.1D3.7D8G3D5.2D9G7D6.1D5.", "9.1D4.7D8G3D5.3D9G7D6.1D4.", "8.1S6.6D8G3D5.3D9G7D6.1D4.", "7.1S10.5D6G3D5.3D8G6D9.1S3.", "6.1S13.12D5.3D7G5D12.1S2.", "5.1S17.9D4.5D5G4D14.1S2.", "5.1S29.7D3G4D15.1S2.", "4.1S27.16D17.1S1.", "3.1S28.15D18.1S1.", "3.1S28.15D18.1S1.", "2.1S29.14D20.1S", "2.1D30.13D20.1S", "2.1D31.12D20.1S", "1.1D64.1S", "1.1D64.1S", "1.1D64.1S", "1.5D51.5D4.1S", "7D48.9D2.1S", "8D46.4D4G2D2.1S", "9D43.5D6G2D1.1S", "4D1G4D43.5D6G2D1.1S", "9D43.5D6G2D1.1S", "8D46.4D4G3D1.1S", "7D48.5D1G3D2.1S", "4D52.8D2.1S", "1D56.6D3.1S", "1.1D63.1S1.", "1.1D63.1S1.", "1.1D63.1S1.", "1.1D63.1S1.", "1.1D62.1S2.", "2.1S61.1S2.", "2.1S60.1S3.", "2.1S60.1S3.", "3.1S58.1S4.", "3.1S57.1S5.", "4.1S56.1S5.", "5.1S54.1S6.", "5.1S53.1D7.", "6.1S51.1D8.", "7.1S48.2D9.", "8.2S45.1D11.", "10.1D43.1D12.", "11.1D2.1D37.2D13.", "12.3D36.1S15.", "14.2D33.2S16.", "16.2D49.", "18.1D2S46.", "21.2S44.", "67.", "67.",
+			},
+			{ -- y = seed - 3
+				"31.11D25.", "23.6S2D8.10D1S17.", "19.1D3S16.6D5.4S13.", "17.2D20.7D8.2S11.", "14.3D22.8D9.2S9.", "13.1D9.6D10.8D11.1S8.", "11.2S8.8D10.9D11.2S6.", "10.1S10.8D10.9D13.1S5.", "9.1S11.8D11.9D13.1S4.", "8.1S12.8D11.9D13.1S4.", "7.1S15.6D11.8D15.1S3.", "6.1S33.7D17.1S2.", "5.1S35.5D18.1S2.", "5.1S36.3D19.1S2.", "4.1S62.", "3.1S63.", "3.1S63.", "2.1S64.", "2.1S64.", "2.1S64.", "1.1S65.", "1.1S65.", "1.1D65.", "1.1D65.", "1D65.1S", "1D57.4D4.1S", "1D56.6D3.1S", "1D3.1D52.6D3.1S", "1D56.6D3.1S", "1D57.4D4.1S", "1D59.1D5.1S", "1D65.1S", "1D65.1S", "1.1S63.1S1.", "1.1S63.1S1.", "1.1S63.1S1.", "1.1S63.1S1.", "1.1S62.1S2.", "2.1S61.1S2.", "2.1S60.1S3.", "2.1S60.1S3.", "3.1S58.1S4.", "3.1S57.1S5.", "4.1S56.1S5.", "5.1S54.1S6.", "5.1S53.1S7.", "6.1S51.1S8.", "7.1S48.2S9.", "8.2S45.1S11.", "10.1S43.1S12.", "11.1S40.2S13.", "12.2S37.1S15.", "14.1D1S51.", "16.2S49.", "18.3S46.", "67.", "67.", "67.",
+			},
+			{ -- y = seed - 4
+				"31.8S3D25.", "23.8S11.2D6S17.", "19.4S27.4S13.", "17.2S35.2S11.", "14.3S39.2S9.", "13.1S44.1S8.", "11.2S46.2S6.", "10.1S50.1S5.", "9.1S52.1S4.", "62.1S4.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "2.1S64.", "2.1S64.", "1.1S65.", "1.1S65.", "1.1S65.", "1.1S65.", "1S66.", "1S66.", "1S66.", "1S66.", "1S66.", "1S66.", "1S66.", "1S66.", "1S66.", "1.1S65.", "1.1S65.", "1.1S65.", "1.1S65.", "1.1S65.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "59.1S7.", "58.1S8.", "56.2S9.", "55.1S11.", "10.1S43.1S12.", "11.1S40.2S13.", "12.2S53.", "14.2S51.", "16.2S49.", "18.1S48.", "67.", "67.", "67.",
+			},
+			{ -- y = seed - 5
+				"31.11S25.", "29.2S11.7S18.", "19.1S47.", "17.2S48.", "14.3S50.", "13.1S53.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "1.1S65.", "1.1S65.", "1S66.", "1S66.", "1S66.", "1S66.", "1S66.", "1S66.", "1S66.", "1S66.", "1S66.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "14.1S52.", "67.", "67.", "67.", "67.", "67.",
+			},
+			{ -- y = seed - 6
+				"39.3S25.", "42.2S23.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.", "67.",
+			},
+		},
+	},
+}
+
+local TERRAIN_BLOCKS = {
+	G = "GrassBlock",
+	D = "DirtBlock",  -- falls back to GrassBlock if you don't own enough dirt
+	S = "StoneBlock",
+}
+
+local function terrainBlueprint(sx, sy, sz)
+	local data = TERRAINS[CFG.TerrainSize] or TERRAINS[2]
+	local cells = {}
+	for layer, rows in ipairs(data.layers) do
+		local y = sy + data.top - (layer - 1)
+		for r, row in ipairs(rows) do
+			local c = 0
+			for count, ch in row:gmatch("(%d+)(%D)") do
+				count = tonumber(count)
+				local id = TERRAIN_BLOCKS[ch]
+				if id then
+					for i = 0, count - 1 do
+						local x = sx + (c + i - data.c0)
+						local z = sz + data.r0 - (r - 1)
+						cells[fmt(x, y, z)] = { x, y, z, id }
+					end
+				end
+				c += count
+			end
 		end
 	end
-	return best, bestDist
+	return cells
 end
 
+-- ===== what you own =====
+local inventory -- item counts, from the server's InventoryChanged messages
+do
+	local inv = RS:WaitForChild("Remotes"):FindFirstChild("InventoryChanged")
+	if inv then
+		inv.OnClientEvent:Connect(function(items)
+			if type(items) == "table" then inventory = items end
+		end)
+	end
+end
+
+-- dirt: use DirtBlock for as many cells as you own; the rest become GrassBlock (its sides look like dirt anyway)
+local function resolveDirt(blueprint)
+	local dirt = {}
+	for _, c in pairs(blueprint) do
+		if c[4] == "DirtBlock" then dirt[#dirt + 1] = c end
+	end
+	if #dirt == 0 then return end
+
+	if not inventory then task.wait(1.5) end -- give the server a moment to send your item counts
+	local have = inventory and (inventory["DirtBlock"] or 0) or math.huge
+	if have >= #dirt then
+		print(("[Builder] dirt: %d DirtBlock"):format(#dirt))
+		return
+	end
+
+	for i, c in ipairs(dirt) do
+		if i > have then c[4] = "GrassBlock" end
+	end
+	print(("[Builder] dirt: you own %d DirtBlock, so %d dirt cells use GrassBlock instead"):format(have, #dirt - have))
+	notify("Not enough dirt", ("You own %d DirtBlock; %d of %d dirt layers will use GrassBlock."):format(have, #dirt - have, #dirt))
+end
+
+-- ===== state =====
+local Enabled = false
+local RunId = 0
+local building = false
+local buildStart, buildEnd = math.huge, 0
+
+local BlocksFolder
+local occupied = {}  -- ["x,y,z"] = block
+local blockKey = {}  -- [block] = "x,y,z"
+local conns = {}
+
+local function findBlocksFolder()
+	local fallback
+	for _, island in ipairs(workspace:GetChildren()) do
+		if island.Name:match("^Island_") then
+			local blocks = island:FindFirstChild("Blocks")
+			if blocks then
+				if island.Name:find(tostring(player.UserId), 1, true) then
+					return blocks
+				end
+				fallback = fallback or blocks
+			end
+		end
+	end
+	return fallback
+end
+
+-- fast lookup of what's placed, instead of scanning the folder for every cell
+local function register(block)
+	local key = block:GetAttribute("CellKey")
+	if key then
+		occupied[key] = block
+		blockKey[block] = key
+		return
+	end
+	local conn
+	conn = block:GetAttributeChangedSignal("CellKey"):Connect(function()
+		local k = block:GetAttribute("CellKey")
+		if k then
+			occupied[k] = block
+			blockKey[block] = k
+			conn:Disconnect()
+		end
+	end)
+	task.delay(3, function()
+		if conn.Connected then conn:Disconnect() end
+	end)
+end
+
+local function unregister(block)
+	local key = blockKey[block]
+	if key then
+		if occupied[key] == block then occupied[key] = nil end
+		blockKey[block] = nil
+	end
+end
+
+local function blockPos(b)
+	if b:IsA("BasePart") then return b.Position end
+	return b:GetPivot().Position
+end
+
+-- ===== moving you along with the build =====
 local function getChar()
 	local char = player.Character
 	if not char then return end
 	local hum = char:FindFirstChildOfClass("Humanoid")
 	local root = char:FindFirstChild("HumanoidRootPart")
-	if not hum or not root or hum.Health <= 0 then return end
-	return char, hum, root
+	if hum and root and hum.Health > 0 then
+		return hum, root
+	end
 end
 
--- ===== Equip =====
-local function equip(toolName)
-	pcall(function()
-		Remotes.RequestEquipSlot:FireServer(toolName)
+local hoverCF, hoverConn
+
+local function startHover(hum, root)
+	if hoverConn then return end
+	hoverCF = root.CFrame
+	hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false) -- no falling pose while hovering
+	hoverConn = RunService.Heartbeat:Connect(function()
+		if root.Parent then
+			root.CFrame = hoverCF -- hold position so you don't drop between moves
+			root.AssemblyLinearVelocity = Vector3.zero
+			if hum:GetState() == Enum.HumanoidStateType.Freefall then
+				hum:ChangeState(Enum.HumanoidStateType.Running)
+			end
+		end
 	end)
 end
 
--- ===== Glide / Tween Movement =====
-local function glideTo(target)
-	local char, hum, root = getChar()
+local function stopHover()
+	if hoverConn then
+		hoverConn:Disconnect()
+		hoverConn = nil
+	end
+	hoverCF = nil
+	local hum = getChar()
+	if hum then
+		hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+		hum:Move(Vector3.zero, false)
+	end
+end
+
+-- glide to `goal` for as long as `active()` stays true
+local function glideActive(goal, active)
+	local hum, root = getChar()
 	if not hum then return false end
+	startHover(hum, root)
 
-	local start = os.clock()
-	hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false) -- No falling pose
-
-	while state.WalkToTarget and target.Parent and hum.Health > 0 do
-		local targetPos = target:GetPivot().Position
-		if (targetPos - root.Position).Magnitude <= CFG.StopDistance then
-			hum:Move(Vector3.zero, false)
-			return true
-		end
-		if os.clock() - start > CFG.GlideTimeout then
-			break
-		end
+	while active() do
+		if hum.Health <= 0 then return false end
+		local d = goal - hoverCF.Position
+		if d.Magnitude <= 0.75 then break end
 
 		local dt = RunService.Heartbeat:Wait()
-		local offset = targetPos - root.Position
-        
-		if offset.Magnitude > 0.5 then
-			local step = math.min(CFG.GlideSpeed * dt, offset.Magnitude)
-			root.CFrame = root.CFrame + offset.Unit * step
-		end
-		root.AssemblyLinearVelocity = Vector3.zero -- Hover in place
+		hoverCF = hoverCF + d.Unit * math.min(CFG.GlideSpeed * dt, d.Magnitude)
 
-		-- Play walking animation so it looks somewhat legit
-		local flat = Vector3.new(offset.X, 0, offset.Z)
+		local flat = Vector3.new(d.X, 0, d.Z) -- plays the walking animation while gliding
 		hum:Move(flat.Magnitude > 1 and flat.Unit or Vector3.zero, false)
-		if hum:GetState() == Enum.HumanoidStateType.Freefall then
-			hum:ChangeState(Enum.HumanoidStateType.Running)
-		end
 	end
 
 	hum:Move(Vector3.zero, false)
-	return target.Parent ~= nil and (target:GetPivot().Position - root.Position).Magnitude <= CFG.AttackRange
+	return true
 end
 
--- ===== Attack / Harvest =====
-local function getHitbox(target)
-    return target:FindFirstChild("Reach") or target.PrimaryPart or target
+-- glide to a point `offset` studs above `pos` (the builder's version)
+local function glideAbove(pos, offset, run)
+	return glideActive(pos + Vector3.new(0, offset, 0), function()
+		return Enabled and run == RunId
+	end)
 end
 
-local function attackStep()
-    local char, hum, root = getChar()
-    if not root then return end
-    
-    local target, dist = nearestTarget(root.Position)
-    if not target or dist > CFG.AttackRange then return end
-    
-    -- Auto Tool Swap
-    if validTrees[target.Name] then
-        if not char:FindFirstChild("Iron Axe") and not char:FindFirstChild("Axe") then equip("Axe") end
-    elseif validOres[target.Name] then
-        if not char:FindFirstChild("Iron Pickaxe") and not char:FindFirstChild("Pickaxe") then equip("Pickaxe") end
-    elseif validMobs[target.Name] then
-        if not char:FindFirstChild("Iron Sword") and not char:FindFirstChild("Sword") then equip("Weapon") end
-    end
+-- ===== the snake builder =====
+local function build(seedKey, run)
+	local Remote = RS:WaitForChild("Remotes"):WaitForChild("RequestPlace")
 
-    local hitbox = getHitbox(target)
-    
-    pcall(function()
-        for _ = 1, CFG.SwingsPerTick do
-            Remotes.RequestSwing:FireServer(hitbox)
-        end
-    end)
+	local sx, sy, sz = seedKey:match(KEY_PATTERN)
+	sx, sy, sz = tonumber(sx), tonumber(sy), tonumber(sz)
+	if not sx then return end
+
+	-- every cell of the terrain that isn't there yet
+	local blueprint = terrainBlueprint(sx, sy, sz)
+	resolveDirt(blueprint)
+
+	local pending, total, counts = {}, 0, {}
+	for key, c in pairs(blueprint) do
+		if not occupied[key] then
+			pending[key] = c -- { x, y, z, blockId }
+			total += 1
+			counts[c[4]] = (counts[c[4]] or 0) + 1
+		end
+	end
+
+	local materials = {}
+	for id, n in pairs(counts) do
+		materials[#materials + 1] = ("%dx %s"):format(n, id)
+	end
+	table.sort(materials)
+	print(("[Builder] terrain from %s: %d blocks (%s)"):format(seedKey, total, table.concat(materials, ", ")))
+	notify("Building the terrain", ("%d blocks: %s"):format(total, table.concat(materials, ", ")))
+
+	-- frontier = cells that touch a placed block, grouped by layer (y)
+	local frontierByY = {}
+	local function addFrontier(key, c)
+		local set = frontierByY[c[2]]
+		if not set then
+			set = {}
+			frontierByY[c[2]] = set
+		end
+		set[key] = c
+	end
+
+	for key, c in pairs(pending) do
+		for _, d in ipairs(DIRS) do
+			if occupied[fmt(c[1] + d[1], c[2] + d[2], c[3] + d[3])] then
+				addFrontier(key, c)
+				break
+			end
+		end
+	end
+
+	-- a cell is finished (placed or given up on)
+	local function finish(key)
+		local c = pending[key]
+		if not c then return nil end
+		pending[key] = nil
+		local set = frontierByY[c[2]]
+		if set then set[key] = nil end
+		return c
+	end
+
+	-- a placed cell opens up its neighbours
+	local function confirm(key)
+		if not finish(key) then return end
+		local x, y, z = key:match(KEY_PATTERN)
+		x, y, z = tonumber(x), tonumber(y), tonumber(z)
+		for _, d in ipairs(DIRS) do
+			local nk = fmt(x + d[1], y + d[2], z + d[3])
+			local nc = pending[nk]
+			if nc then addFrontier(nk, nc) end
+		end
+	end
+
+	-- the placed blocks a cell touches, with the face normal pointing from each one towards the cell
+	local function supporters(c, preferKey)
+		local list = {}
+		for _, d in ipairs(DIRS) do
+			local sk = fmt(c[1] + d[1], c[2] + d[2], c[3] + d[3])
+			local sb = occupied[sk]
+			if sb and sb.Parent then
+				local entry = { key = sk, normal = Vector3.new(-d[1], -d[2], -d[3]) }
+				if sk == preferKey then
+					table.insert(list, 1, entry)
+				else
+					list[#list + 1] = entry
+				end
+			end
+		end
+		return list
+	end
+
+	local cx, cy, cz = sx, sy, sz -- where we are (the last block we placed)
+	local lastDx, lastDz = 0, 0
+	local curKey = seedKey
+
+	-- layer by layer from the top; inside a layer keep moving to a neighbouring cell (snake),
+	-- and only jump to the nearest open cell when we're boxed in
+	local function pickNext()
+		local activeY
+		for y, set in pairs(frontierByY) do
+			if next(set) ~= nil and (not activeY or y > activeY) then
+				activeY = y
+			end
+		end
+		if not activeY then return nil end
+		local set = frontierByY[activeY]
+
+		local bestKey, bestScore
+		if cy == activeY then
+			for _, d in ipairs(HORIZONTAL) do
+				local nk = fmt(cx + d[1], activeY, cz + d[2])
+				if set[nk] then
+					-- prefer the neighbour with the fewest open cells around it (keeps the snake from leaving holes),
+					-- and going straight over turning
+					local open = 0
+					for _, e in ipairs(HORIZONTAL) do
+						if pending[fmt(cx + d[1] + e[1], activeY, cz + d[2] + e[2])] then open += 1 end
+					end
+					local score = open - ((d[1] == lastDx and d[2] == lastDz) and 0.5 or 0)
+					if not bestScore or score < bestScore then
+						bestKey, bestScore = nk, score
+					end
+				end
+			end
+		elseif cy - 1 == activeY and set[fmt(cx, activeY, cz)] then
+			bestKey = fmt(cx, activeY, cz) -- stepping down to the next layer
+		end
+		if bestKey then return bestKey, set[bestKey] end
+
+		local nearestKey, nearestD
+		for key, c in pairs(set) do
+			local dx, dy, dz = c[1] - cx, c[2] - cy, c[3] - cz
+			local dist = dx * dx + dy * dy + dz * dz
+			if not nearestD or dist < nearestD then
+				nearestKey, nearestD = key, dist
+			end
+		end
+		return nearestKey, set[nearestKey]
+	end
+
+	local delay = CFG.PlaceDelay
+
+	-- place one block: get next to it, send the request, wait until it really exists
+	local function placeOne(key, c)
+		local sups = supporters(c, curKey)
+		if #sups == 0 then return false end
+
+		for attempt = 1, CFG.MaxRetries + 1 do
+			if not Enabled or run ~= RunId then return false end
+
+			local sup = sups[((attempt - 1) % #sups) + 1]
+			local sb = occupied[sup.key]
+			if sb and sb.Parent then
+				-- retries come in closer, in case it was out of reach
+				if not glideAbove(blockPos(sb), attempt == 1 and CFG.HoverHeight or 2, run) then
+					return false
+				end
+			end
+
+			local normal = (attempt == 2) and FIXED_NORMAL or sup.normal
+			Remote:FireServer({ x = c[1], y = c[2], z = c[3] }, c[4], 0, normal, false, nil, false)
+
+			local deadline = os.clock() + CFG.CheckTimeout
+			while not occupied[key] and os.clock() < deadline and Enabled and run == RunId do
+				task.wait(0.03)
+			end
+			if occupied[key] then return true end
+
+			delay = math.min(math.max(delay * 1.6, 0.15), CFG.MaxDelay)
+			print(("[Builder] %s didn't show up (try %d), delay now %.2fs"):format(key, attempt, delay))
+		end
+		return false
+	end
+
+	local placed, failed = 0, 0
+
+	while Enabled and run == RunId do
+		local key, c = pickNext()
+		if not key then break end
+
+		local ok = placeOne(key, c)
+		if not Enabled or run ~= RunId then
+			print("[Builder] cancelled")
+			return
+		end
+
+		if ok then
+			placed += 1
+			if c[2] == cy then lastDx, lastDz = c[1] - cx, c[3] - cz end
+			confirm(key)
+			cx, cy, cz, curKey = c[1], c[2], c[3], key
+
+			-- follow the build: glide right above the block we just placed
+			local b = occupied[key]
+			if b and b.Parent then
+				glideAbove(blockPos(b), CFG.HoverHeight, run)
+			end
+			delay = math.max(CFG.PlaceDelay, delay * 0.95)
+
+			if placed % 100 == 0 then
+				print(("[Builder] %d / %d placed"):format(placed, total))
+			end
+		else
+			failed += 1
+			finish(key)
+			warn("[Builder] gave up on " .. key)
+		end
+
+		task.wait(delay)
+	end
+
+	local left = 0
+	for _ in pairs(pending) do left += 1 end
+	print(("[Builder] done: %d placed, %d failed, %d not reachable"):format(placed, failed, left))
+	notify("Terrain finished", ("%d placed, %d skipped"):format(placed, failed + left))
 end
 
--- ===== UI Setup =====
-main:CreateToggle({
-	name = "Walk / Glide to Target",
-	flag = "WalkToTarget",
+local function runBuild(seedKey, run)
+	building = true
+	buildStart, buildEnd = os.clock(), math.huge
+	local ok, err = pcall(build, seedKey, run)
+	buildEnd = os.clock()
+	building = false
+	stopHover()
+	if not ok then
+		warn("[Builder] error: " .. tostring(err))
+	end
+end
+
+-- the block you place by hand becomes the centre of the island's top
+local function onBlockAdded(block, run)
+	register(block)
+	local added = os.clock()
+
+	task.delay(0.15, function()
+		if not Enabled or run ~= RunId then return end
+		if building or (added >= buildStart and added <= buildEnd) then return end -- our own placements
+
+		local key = block:GetAttribute("CellKey")
+		if not key or not key:match(KEY_PATTERN) then return end
+		task.spawn(runBuild, key, run)
+	end)
+end
+
+local function disconnectAll()
+	for _, c in ipairs(conns) do c:Disconnect() end
+	conns = {}
+end
+
+-- ===== auto break grass =====
+-- RequestSwing:FireServer(block) is what a pickaxe swing at a block sends (seen in Cobalt). Hold your pickaxe.
+-- Swings at every GrassBlock within BreakRange of you, nearest first. When none are left in range it hovers
+-- over to the nearest GrassBlock anywhere on your island and carries on, until there's no grass left.
+local breakingOn = false
+local breakRun = 0
+
+local function startBreaking()
+	breakRun += 1
+	local run = breakRun
+	local function active()
+		return breakingOn and run == breakRun
+	end
+
+	task.spawn(function()
+		local blocks = findBlocksFolder()
+		if not blocks then
+			warn("[Builder] couldn't find your island's Blocks folder")
+			return
+		end
+		local Swing = RS:WaitForChild("Remotes"):WaitForChild("RequestSwing")
+
+		local params = OverlapParams.new()
+		params.FilterType = Enum.RaycastFilterType.Include
+		params.FilterDescendantsInstances = { blocks }
+
+		-- GrassBlocks around a point, nearest first (the engine does the range search, so this stays cheap)
+		local function grassNear(pos)
+			local list = {}
+			for _, part in ipairs(workspace:GetPartBoundsInRadius(pos, CFG.BreakRange, params)) do
+				if part.Parent == blocks and part:GetAttribute("BlockId") == "GrassBlock" then
+					list[#list + 1] = { part = part, dist = (part.Position - pos).Magnitude }
+				end
+			end
+			table.sort(list, function(a, b) return a.dist < b.dist end)
+			return list
+		end
+
+		-- the nearest GrassBlock anywhere on the island
+		local function nearestGrass(pos)
+			local best, bestDist
+			for _, b in ipairs(blocks:GetChildren()) do
+				if b:IsA("BasePart") and b:GetAttribute("BlockId") == "GrassBlock" then
+					local d = (b.Position - pos).Magnitude
+					if not bestDist or d < bestDist then best, bestDist = b, d end
+				end
+			end
+			return best
+		end
+
+		local broken = 0
+		while active() do
+			if building then
+				task.wait(0.5) -- don't fight the builder for control of your character
+			else
+				local hum, root = getChar()
+				if not hum then
+					task.wait(0.5)
+				else
+					local origin = hoverCF and hoverCF.Position or root.Position
+					local list = grassNear(origin)
+
+					if #list > 0 then
+						startHover(hum, root) -- hold position so you don't fall as the ground disappears
+						for i = 1, math.min(#list, 40) do
+							if not active() then break end
+							local part = list[i].part
+							if part.Parent == blocks then
+								Swing:FireServer(part)
+								broken += 1
+								task.wait(CFG.SwingDelay)
+							end
+						end
+					else
+						local target = nearestGrass(origin)
+						if not target then
+							print(("[Builder] no GrassBlocks left (%d swings)"):format(broken))
+							notify("Auto Break Grass", "No GrassBlocks left.")
+							break
+						end
+						glideActive(target.Position + Vector3.new(0, CFG.HoverHeight + 2, 0), active)
+					end
+				end
+			end
+			task.wait()
+		end
+
+		if not building then stopHover() end
+	end)
+end
+
+-- ===== UI =====
+Tab:CreateToggle(dual({
+	name = "Auto Builder",
+	flag = "AutoBuilder",
 	currentValue = false,
 	callback = function(on)
-		state.WalkToTarget = on
-		if on then
-			task.spawn(function()
-				while state.WalkToTarget do
-					local _, _, root = getChar()
-                    if root then
-                        local target = nearestTarget(root.Position)
-                        if target then
-                            glideTo(target)
-                        end
-                    end
-					task.wait(0.1)
-				end
-			end)
+		Enabled = on
+		RunId += 1
+		disconnectAll()
+
+		if not on then
+			notify("Auto Builder off", "Stopped.")
+			return
 		end
+
+		BlocksFolder = findBlocksFolder()
+		if not BlocksFolder then
+			warn("[Builder] couldn't find your island's Blocks folder")
+			return
+		end
+
+		occupied, blockKey = {}, {}
+		for _, block in ipairs(BlocksFolder:GetChildren()) do
+			register(block)
+		end
+
+		local run = RunId
+		table.insert(conns, BlocksFolder.ChildAdded:Connect(function(block)
+			onBlockAdded(block, run)
+		end))
+		table.insert(conns, BlocksFolder.ChildRemoved:Connect(unregister))
+
+		notify("Terrain Builder on", "Place a GrassBlock where the centre of the terrain should be.")
+		print("[Builder] armed")
 	end,
-})
+}))
 
-main:CreateToggle({
-	name = "Auto Attack (Mobs)",
-	flag = "AutoMobs",
-	currentValue = false,
-	callback = function(on) state.AutoMobs = on end,
-})
+pcall(function()
+	Tab:CreateSlider(dual({
+		name = "Terrain Size (1 Small, 2 Medium, 3 Large)",
+		flag = "TerrainSize",
+		range = { 1, 3 },
+		increment = 1,
+		suffix = "",
+		currentValue = CFG.TerrainSize,
+		callback = function(v)
+			CFG.TerrainSize = math.clamp(math.floor(v), 1, #TERRAINS)
+			local data = TERRAINS[CFG.TerrainSize]
+			local n = 0
+			for _ in pairs(terrainBlueprint(0, 0, 0)) do n += 1 end
+			notify("Terrain: " .. data.name, ("%d blocks. Place a GrassBlock at the centre of the terrain."):format(n))
+		end,
+	}))
+end)
 
-resourceTab:CreateToggle({
-	name = "Auto Mine (Ores)",
-	flag = "AutoOres",
-	currentValue = false,
-	callback = function(on) state.AutoOres = on end,
-})
-
-resourceTab:CreateToggle({
-	name = "Auto Chop (Trees)",
-	flag = "AutoTrees",
-	currentValue = false,
-	callback = function(on) state.AutoTrees = on end,
-})
-
-main:CreateToggle({
-	name = "Enable Attacker",
-	flag = "AutoAttack",
+Tab:CreateToggle(dual({
+	name = "Auto Break Grass",
+	flag = "AutoBreakGrass",
 	currentValue = false,
 	callback = function(on)
-		state.AutoAttack = on
+		breakingOn = on
 		if on then
-			task.spawn(function()
-				while state.AutoAttack do
-					pcall(attackStep)
-					task.wait(CFG.SwingDelay)
-				end
-			end)
+			notify("Auto Break Grass on", "Hold your pickaxe. It breaks GrassBlocks near you, then hovers on to the next ones.")
+			startBreaking()
+		else
+			breakRun += 1
+			notify("Auto Break Grass off", "Stopped.")
 		end
 	end,
-})
+}))
 
-settingsTab:CreateSlider({
-	name = "Glide Speed",
-    range = { 10, 150 },
-    increment = 5,
-    suffix = " studs/s",
-    currentValue = CFG.GlideSpeed,
-	callback = function(val)
-		CFG.GlideSpeed = val
-	end,
-})
+pcall(function()
+	Tab:CreateSlider(dual({
+		name = "Break Speed",
+		flag = "BreakSpeed",
+		range = { 0.05, 1 },
+		increment = 0.05,
+		suffix = " s",
+		currentValue = CFG.SwingDelay,
+		callback = function(v) CFG.SwingDelay = v end,
+	}))
+end)
+
+pcall(function()
+	Tab:CreateSlider(dual({
+		name = "Place Delay",
+		flag = "BuilderDelay",
+		range = { 0.03, 1 },
+		increment = 0.01,
+		suffix = " s",
+		currentValue = CFG.PlaceDelay,
+		callback = function(v) CFG.PlaceDelay = v end,
+	}))
+end)
+
+notify("VANTA Terrain Builder", "Loaded. Turn Auto Builder on, then place one Grass Block.")
