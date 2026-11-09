@@ -1,51 +1,195 @@
---==================================================
--- VANTA | MEGA FARM (Soul Scepter + Priority)
--- Priorities: Boss > Gold Ore > Other Targets
---==================================================
-
+-- autobuilder_v5.2.0 (120x120 Fortress with StoneBrick)
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
-
 local player = Players.LocalPlayer
 
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
 
-local Window = Rayfield:CreateWindow({
-    name = "VANTA | Mega Farm",
-    loadingTitle = "VANTA",
-    loadingSubtitle = "by dj",
-})
+local function dual(t)
+	local out = {}
+	for k, v in pairs(t) do
+		out[k] = v
+		out[k:sub(1, 1):upper() .. k:sub(2)] = v
+	end
+	return out
+end
 
-local Tab = Window:CreateTab({ name = "Farm" })
+local Window = Rayfield:CreateWindow(dual({
+	name = "VANTA | Fortress Builder",
+	loadingTitle = "VANTA",
+	loadingSubtitle = "120x120 Fortress",
+}))
+local Tab = Window:CreateTab(dual({ name = "Builder" }))
 
 local CFG = {
-    GlideSpeed = 40,
-    
-    -- Hover Heights
-    BossHoverHeight = 15,
-    MobHoverHeight = 15,
-    NodeHoverHeight = -5, -- Below the ore
-    TreeHoverHeight = 6,  -- Above the tree
-
-    ShootRange = 25,
-    ShootDelay = 0.3,
-    MeleeRange = 14,
-    MeleeDelay = 0.22,
+	PlaceDelay = 0.1,
+	MaxDelay = 1.0,
+	CheckTimeout = 3,
+	MaxRetries = 4,
+	GlideSpeed = 30,
+	HoverHeight = 4,
+	TerrainRadius = 60, -- 60 = 120x120 diameter
+	BreakRange = 15,
+	SwingDelay = 0.2,
 }
 
-local state = {
-    AutoFarm = false,
-    Mob = false,
-    Ore = false,
-    Tree = false,
-    Boss = false,
+local FIXED_NORMAL = Vector3.new(-1, 0, 0)
+local KEY_PATTERN = "^(-?%d+),(-?%d+),(-?%d+)$"
+local DIRS = {
+	{ 1, 0, 0 }, { -1, 0, 0 },
+	{ 0, 1, 0 }, { 0, -1, 0 },
+	{ 0, 0, 1 }, { 0, 0, -1 },
 }
+local HORIZONTAL = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }
 
-local shotCounter = 1
+local function fmt(x, y, z)
+	return string.format("%d,%d,%d", x, y, z)
+end
 
-local skeletonNames = { ["Skeleton"] = true, ["SkeletonArcher"] = true, ["SkeletonKnight"] = true, ["SkeletonWarrior"] = true }
-local bossNames = { ["Morten"] = true }
+local function notify(title, content)
+	pcall(function()
+		Rayfield:Notify(dual({ title = title, content = content, duration = 4 }))
+	end)
+end
+
+-- ==================================================
+-- PROCEDURAL GENERATOR (120x120 Fortress Wall)
+-- ==================================================
+local function terrainBlueprint(sx, sy, sz)
+	local cells = {}
+	local radius = CFG.TerrainRadius
+	local flatRadius = 50 -- Flat area radius
+	local wallThickness = 5 -- How thick the wall base is
+
+	for x = -radius, radius do
+		for z = -radius, radius do
+			local dist = math.sqrt(x*x + z*z)
+			
+			if dist <= radius then
+				local wx = sx + x
+				local wz = sz + z
+				
+				if dist <= flatRadius then
+					-- FLAT GRASS CENTER
+					local wy = sy
+					cells[fmt(wx, wy, wz)] = {wx, wy, wz, "GrassBlock"}
+					-- Dirt underneath
+					for by = wy - 1, sy - 5, -1 do
+						cells[fmt(wx, by, wz)] = {wx, by, wz, "DirtBlock"}
+					end
+				else
+					-- CLIFF EDGE & WALL
+					-- Step up the ground gradually
+					local yOffset = math.floor((dist - flatRadius) / 2)
+					local groundY = sy + yOffset
+					
+					-- Build base ground (Normal Stone)
+					for by = groundY, sy - 5, -1 do
+						cells[fmt(wx, by, wz)] = {wx, by, wz, "Stone"}
+					end
+
+					-- Build the vertical wall (Shell)
+					if dist > (radius - wallThickness) then
+						local wallHeight = 10 + math.random(0, 3) -- 10-13 blocks high
+						
+						for wy = groundY + 1, groundY + wallHeight do
+							-- Mix StoneBrick and Stone for a ruined fortress look
+							local blockType = "StoneBrick"
+							if math.random(1, 100) <= 30 then blockType = "Stone" end
+							if wy == groundY + wallHeight then blockType = "StoneBrick" end -- Flat top
+							
+							cells[fmt(wx, wy, wz)] = {wx, wy, wz, blockType}
+						end
+					end
+				end
+			end
+		end
+	end
+	return cells
+end
+
+-- ===== what you own =====
+local inventory
+do
+	local inv = RS:WaitForChild("Remotes"):FindFirstChild("InventoryChanged")
+	if inv then
+		inv.OnClientEvent:Connect(function(items)
+			if type(items) == "table" then inventory = items end
+		end)
+	end
+end
+
+local function resolveDirt(blueprint)
+	local dirt = {}
+	for _, c in pairs(blueprint) do
+		if c[4] == "DirtBlock" then dirt[#dirt + 1] = c end
+	end
+	if #dirt == 0 then return end
+	if not inventory then task.wait(1.5) end
+	local have = inventory and (inventory["DirtBlock"] or 0) or math.huge
+	if have >= #dirt then return end
+	for i, c in ipairs(dirt) do
+		if i > have then c[4] = "GrassBlock" end
+	end
+end
+
+-- ===== state =====
+local Enabled = false
+local RunId = 0
+local building = false
+local buildStart, buildEnd = math.huge, 0
+
+local BlocksFolder
+local occupied = {}
+local blockKey = {}
+local conns = {}
+
+local function findBlocksFolder()
+	local fallback
+	for _, island in ipairs(workspace:GetChildren()) do
+		if island.Name:match("^Island_") then
+			local blocks = island:FindFirstChild("Blocks")
+			if blocks then
+				if island.Name:find(tostring(player.UserId), 1, true) then return blocks end
+				fallback = fallback or blocks
+			end
+		end
+	end
+	return fallback
+end
+
+local function register(block)
+	local key = block:GetAttribute("CellKey")
+	if key then
+		occupied[key] = block
+		blockKey[block] = key
+		return
+	end
+	local conn
+	conn = block:GetAttributeChangedSignal("CellKey"):Connect(function()
+		local k = block:GetAttribute("CellKey")
+		if k then
+			occupied[k] = block
+			blockKey[block] = k
+			conn:Disconnect()
+		end
+	end)
+	task.delay(3, function() if conn.Connected then conn:Disconnect() end end)
+end
+
+local function unregister(block)
+	local key = blockKey[block]
+	if key then
+		if occupied[key] == block then occupied[key] = nil end
+		blockKey[block] = nil
+	end
+end
+
+local function blockPos(b)
+	if b:IsA("BasePart") then return b.Position end
+	return b:GetPivot().Position
+end
 
 local function getChar()
 	local char = player.Character
@@ -55,248 +199,362 @@ local function getChar()
 	if hum and root and hum.Health > 0 then return hum, root end
 end
 
-local function isAlive(m, isMob)
-	if not m.Parent then return false end
-	if isMob then
-		local hum = m:FindFirstChildOfClass("Humanoid")
-		if hum then return hum.Health > 0 end
-		local hp = m:GetAttribute("Health")
-		if type(hp) == "number" then return hp > 0 end
-	end
-	return true
-end
-
---==================================================
--- TARGETING & PRIORITY
---==================================================
-
-local function getNearestTarget(root)
-	local ruins = workspace:FindFirstChild("Ruins")
-	local ruinsBoss = workspace:FindFirstChild("RuinsBoss")
-    
-	local best, bestDist, bestIsMob = nil, math.huge, false
-
-	-- 1. BOSS (Highest Priority)
-	if state.Boss and ruinsBoss then
-		for _, inst in ipairs(ruinsBoss:GetDescendants()) do
-			if inst:IsA("Model") and bossNames[inst.Name] and isAlive(inst, true) then
-                return inst, true
-			end
-		end
-	end
-
-	if not ruins then return nil end
-
-    -- 2. GOLD ORE PRIORITY (Inside ResourceField)
-    if state.Ore then
-        local folder = ruins:FindFirstChild("ResourceField")
-        if folder then
-            for _, inst in ipairs(folder:GetDescendants()) do
-                if inst:IsA("Model") and inst.Name == "GoldOre" and isAlive(inst, false) then
-                    return inst, false
-                end
-            end
-        end
-    end
-
-	-- 3. MOBS
-	if state.Mob then
-		local folder = ruins:FindFirstChild("Guardians")
-		if folder then
-			for _, inst in ipairs(folder:GetDescendants()) do
-				if inst:IsA("Model") and skeletonNames[inst.Name] and isAlive(inst, true) then
-					local mobRoot = inst:FindFirstChild("HumanoidRootPart")
-                    if mobRoot then
-                        local d = (mobRoot.Position - root.Position).Magnitude
-                        if d < bestDist then best = inst; bestDist = d; bestIsMob = true end
-                    end
-				end
-			end
-		end
-	end
-
-	-- 4. OTHER ORES / TREES
-	if state.Ore or state.Tree then
-		local folder = ruins:FindFirstChild("ResourceField")
-		if folder then
-			for _, inst in ipairs(folder:GetDescendants()) do
-				if inst:IsA("Model") and inst.Parent == folder and isAlive(inst, false) then
-					local isOre = (inst.Name:find("Ore") or inst.Name == "Coal") and inst.Name ~= "GoldOre"
-					local isTree = inst.Name:find("Pine") or inst.Name:find("Tree")
-					local valid = (state.Ore and isOre) or (state.Tree and isTree)
-					
-					if valid then
-                        local reach = inst:FindFirstChild("Reach") or inst.PrimaryPart
-                        local pos = reach and reach.Position or inst:GetPivot().Position
-						local d = (pos - root.Position).Magnitude
-						if d < bestDist then best = inst; bestDist = d; bestIsMob = false end
-					end
-				end
-			end
-		end
-	end
-
-	return best, bestIsMob
-end
-
---==================================================
--- EQUIP TOOL
---==================================================
-
-local function equipFor(isMob, name)
-	local tool = "SoulScepter"
-    if not isMob then
-        if name == "GoldOre" or name:find("Ore") or name == "Coal" then
-            tool = "Pickaxe"
-        else
-            tool = "Axe"
-        end
-    end
-	
-	local char = player.Character
-	if char then
-        local currentTool = char:FindFirstChildOfClass("Tool")
-        if not currentTool or not currentTool.Name:find(tool) then
-		    RS.Remotes.RequestEquipSlot:FireServer(tool)
-		    task.wait(0.4)
-        end
-	end
-end
-
---==================================================
--- GLIDE & HOVER
---==================================================
-
 local hoverCF, hoverConn
 local function startHover(hum, root)
-    if hoverConn then return end
-    hoverCF = root.CFrame
-    hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
-    hoverConn = RunService.Heartbeat:Connect(function()
-        if root.Parent then
-            root.CFrame = hoverCF
-            root.AssemblyLinearVelocity = Vector3.zero
-        end
-    end)
+	if hoverConn then return end
+	hoverCF = root.CFrame
+	hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
+	hoverConn = RunService.Heartbeat:Connect(function()
+		if root.Parent then
+			root.CFrame = hoverCF
+			root.AssemblyLinearVelocity = Vector3.zero
+			if hum:GetState() == Enum.HumanoidStateType.Freefall then
+				hum:ChangeState(Enum.HumanoidStateType.Running)
+			end
+		end
+	end)
 end
 
 local function stopHover()
-    if hoverConn then hoverConn:Disconnect(); hoverConn = nil end
-    hoverCF = nil
-    local hum = getChar()
-    if hum then
-        hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
-        hum:Move(Vector3.zero, false)
-    end
+	if hoverConn then hoverConn:Disconnect(); hoverConn = nil end
+	hoverCF = nil
+	local hum = getChar()
+	if hum then
+		hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+		hum:Move(Vector3.zero, false)
+	end
 end
 
---==================================================
--- ENGAGE TARGET
---==================================================
-
-local function engage(model, isMob)
-    local ShootRemote = RS.Remotes.RequestShoot
-    local deadline = os.clock() + 25
-    local lastAttack = 0
-
-    -- Target Info
-    local targetRoot = isMob and model:FindFirstChild("HumanoidRootPart") or (model:FindFirstChild("Reach") or model.PrimaryPart)
-    if not targetRoot then return true end
-
-    while state.AutoFarm and os.clock() < deadline do
-        if not isAlive(model, isMob) then return true end
-
-        local hum, root = getChar()
-        if not hum then stopHover(); return false end
-
-        startHover(hum, root)
-        equipFor(isMob, model.Name)
-
-        -- Calculate Goal (Height & Offset)
-        local goal
-        if isMob then
-            goal = targetRoot.Position + Vector3.new(0, CFG.MobHoverHeight, 0)
-        else
-            local isTree = model.Name:find("Pine") or model.Name:find("Tree")
-            local height = isTree and CFG.TreeHoverHeight or CFG.NodeHoverHeight
-            goal = targetRoot.Position + Vector3.new(0, height, 0)
-        end
-
-        local d = goal - hoverCF.Position
-        local dt = RunService.Heartbeat:Wait()
-
-        -- Glide Logic
-        if d.Magnitude > 1.5 then
-            hoverCF = hoverCF + d.Unit * math.min(CFG.GlideSpeed * dt, d.Magnitude)
-            local flat = Vector3.new(d.X, 0, d.Z)
-            hum:Move(flat.Magnitude > 1 and flat.Unit or Vector3.zero, false)
-        else
-            hum:Move(Vector3.zero, false)
-        end
-
-        -- Attack Logic
-        local distanceToTarget = (targetRoot.Position - root.Position).Magnitude
-        
-        if isMob then
-            -- Shoot Mob
-            if distanceToTarget <= CFG.ShootRange and os.clock() - lastAttack >= CFG.ShootDelay then
-                lastAttack = os.clock()
-                local direction = (targetRoot.Position - root.Position).Unit
-                pcall(function()
-                    ShootRemote:FireServer(targetRoot.Position, direction, 1, shotCounter)
-                end)
-                shotCounter += 1
-            end
-        else
-            -- Melee Ore/Tree
-            if distanceToTarget <= CFG.MeleeRange and os.clock() - lastAttack >= CFG.MeleeDelay then
-                lastAttack = os.clock()
-                pcall(function()
-                    RS.Remotes.RequestSwing:FireServer(targetRoot)
-                end)
-            end
-        end
-    end
-    return not isAlive(model, isMob)
+local function glideActive(goal, active)
+	local hum, root = getChar()
+	if not hum then return false end
+	startHover(hum, root)
+	while active() do
+		if hum.Health <= 0 then return false end
+		local d = goal - hoverCF.Position
+		if d.Magnitude <= 0.75 then break end
+		local dt = RunService.Heartbeat:Wait()
+		hoverCF = hoverCF + d.Unit * math.min(CFG.GlideSpeed * dt, d.Magnitude)
+		local flat = Vector3.new(d.X, 0, d.Z)
+		hum:Move(flat.Magnitude > 1 and flat.Unit or Vector3.zero, false)
+	end
+	hum:Move(Vector3.zero, false)
+	return true
 end
 
---==================================================
--- FARM LOOP
---==================================================
-
-local function farmLoop()
-    while state.AutoFarm do
-        local hum, root = getChar()
-        if not hum then
-            stopHover()
-            task.wait(1)
-        else
-            local target, isMob = getNearestTarget(root)
-            if target then
-                engage(target, isMob)
-            else
-                task.wait(0.5)
-            end
-        end
-    end
-    stopHover()
+local function glideAbove(pos, offset, run)
+	return glideActive(pos + Vector3.new(0, offset, 0), function()
+		return Enabled and run == RunId
+	end)
 end
 
---==================================================
--- UI
---==================================================
+-- ===== the snake builder =====
+local function build(seedKey, run)
+	local Remote = RS:WaitForChild("Remotes"):WaitForChild("RequestPlace")
+	local sx, sy, sz = seedKey:match(KEY_PATTERN)
+	sx, sy, sz = tonumber(sx), tonumber(sy), tonumber(sz)
+	if not sx then return end
 
-Tab:CreateToggle({
-    name = "Auto Farm (Mega)",
-    flag = "AutoFarm",
-    currentValue = false,
-    callback = function(on)
-        state.AutoFarm = on
-        if on then task.spawn(farmLoop) else stopHover() end
-    end,
-})
+	local blueprint = terrainBlueprint(sx, sy, sz)
+	resolveDirt(blueprint)
 
-Tab:CreateToggle({ name = "Include Boss (Morten)", flag = "T_Boss", currentValue = false, callback = function(on) state.Boss = on end })
-Tab:CreateToggle({ name = "Include Mobs (Skeletons)", flag = "T_Mob", currentValue = true, callback = function(on) state.Mob = on end })
-Tab:CreateToggle({ name = "Include Ores (Prioritizes Gold)", flag = "T_Ore", currentValue = true, callback = function(on) state.Ore = on end })
-Tab:CreateToggle({ name = "Include Trees (Pine)", flag = "T_Tree", currentValue = true, callback = function(on) state.Tree = on end })
+	local pending, total, counts = {}, 0, {}
+	for key, c in pairs(blueprint) do
+		if not occupied[key] then
+			pending[key] = c
+			total += 1
+			counts[c[4]] = (counts[c[4]] or 0) + 1
+		end
+	end
+
+	local materials = {}
+	for id, n in pairs(counts) do
+		materials[#materials + 1] = ("%dx %s"):format(n, id)
+	end
+	table.sort(materials)
+	notify("Building the Fortress", ("%d blocks: %s"):format(total, table.concat(materials, ", ")))
+
+	local frontierByY = {}
+	local function addFrontier(key, c)
+		local set = frontierByY[c[2]]
+		if not set then set = {}; frontierByY[c[2]] = set end
+		set[key] = c
+	end
+
+	for key, c in pairs(pending) do
+		for _, d in ipairs(DIRS) do
+			if occupied[fmt(c[1] + d[1], c[2] + d[2], c[3] + d[3])] then
+				addFrontier(key, c)
+				break
+			end
+		end
+	end
+
+	local function finish(key)
+		local c = pending[key]
+		if not c then return nil end
+		pending[key] = nil
+		local set = frontierByY[c[2]]
+		if set then set[key] = nil end
+		return c
+	end
+
+	local function confirm(key)
+		if not finish(key) then return end
+		local x, y, z = key:match(KEY_PATTERN)
+		x, y, z = tonumber(x), tonumber(y), tonumber(z)
+		for _, d in ipairs(DIRS) do
+			local nk = fmt(x + d[1], y + d[2], z + d[3])
+			local nc = pending[nk]
+			if nc then addFrontier(nk, nc) end
+		end
+	end
+
+	local function supporters(c, preferKey)
+		local list = {}
+		for _, d in ipairs(DIRS) do
+			local sk = fmt(c[1] + d[1], c[2] + d[2], c[3] + d[3])
+			local sb = occupied[sk]
+			if sb and sb.Parent then
+				local entry = { key = sk, normal = Vector3.new(-d[1], -d[2], -d[3]) }
+				if sk == preferKey then table.insert(list, 1, entry) else list[#list + 1] = entry end
+			end
+		end
+		return list
+	end
+
+	local cx, cy, cz = sx, sy, sz
+	local lastDx, lastDz = 0, 0
+	local curKey = seedKey
+
+	local function pickNext()
+		local activeY
+		for y, set in pairs(frontierByY) do
+			if next(set) ~= nil and (not activeY or y > activeY) then activeY = y end
+		end
+		if not activeY then return nil end
+		local set = frontierByY[activeY]
+
+		local bestKey, bestScore
+		if cy == activeY then
+			for _, d in ipairs(HORIZONTAL) do
+				local nk = fmt(cx + d[1], activeY, cz + d[2])
+				if set[nk] then
+					local open = 0
+					for _, e in ipairs(HORIZONTAL) do
+						if pending[fmt(cx + d[1] + e[1], activeY, cz + d[2] + e[2])] then open += 1 end
+					end
+					local score = open - ((d[1] == lastDx and d[2] == lastDz) and 0.5 or 0)
+					if not bestScore or score < bestScore then bestKey, bestScore = nk, score end
+				end
+			end
+		elseif cy - 1 == activeY and set[fmt(cx, activeY, cz)] then
+			bestKey = fmt(cx, activeY, cz)
+		end
+		if bestKey then return bestKey, set[bestKey] end
+
+		local nearestKey, nearestD
+		for key, c in pairs(set) do
+			local dx, dy, dz = c[1] - cx, c[2] - cy, c[3] - cz
+			local dist = dx * dx + dy * dy + dz * dz
+			if not nearestD or dist < nearestD then nearestKey, nearestD = key, dist end
+		end
+		return nearestKey, set[nearestKey]
+	end
+
+	local delay = CFG.PlaceDelay
+	local function placeOne(key, c)
+		local sups = supporters(c, curKey)
+		if #sups == 0 then return false end
+		for attempt = 1, CFG.MaxRetries + 1 do
+			if not Enabled or run ~= RunId then return false end
+			local sup = sups[((attempt - 1) % #sups) + 1]
+			local sb = occupied[sup.key]
+			if sb and sb.Parent then
+				if not glideAbove(blockPos(sb), attempt == 1 and CFG.HoverHeight or 2, run) then return false end
+			end
+			local normal = (attempt == 2) and FIXED_NORMAL or sup.normal
+			Remote:FireServer({ x = c[1], y = c[2], z = c[3] }, c[4], 0, normal, false, nil, false)
+
+			local deadline = os.clock() + CFG.CheckTimeout
+			while not occupied[key] and os.clock() < deadline and Enabled and run == RunId do task.wait(0.03) end
+			if occupied[key] then return true end
+			delay = math.min(math.max(delay * 1.6, 0.15), CFG.MaxDelay)
+		end
+		return false
+	end
+
+	local placed, failed = 0, 0
+	while Enabled and run == RunId do
+		local key, c = pickNext()
+		if not key then break end
+		local ok = placeOne(key, c)
+		if not Enabled or run ~= RunId then return end
+
+		if ok then
+			placed += 1
+			if c[2] == cy then lastDx, lastDz = c[1] - cx, c[3] - cz end
+			confirm(key)
+			cx, cy, cz, curKey = c[1], c[2], c[3], key
+			local b = occupied[key]
+			if b and b.Parent then glideAbove(blockPos(b), CFG.HoverHeight, run) end
+			delay = math.max(CFG.PlaceDelay, delay * 0.95)
+		else
+			failed += 1
+			finish(key)
+		end
+		task.wait(delay)
+	end
+end
+
+local function runBuild(seedKey, run)
+	building = true
+	buildStart, buildEnd = os.clock(), math.huge
+	local ok, err = pcall(build, seedKey, run)
+	buildEnd = os.clock()
+	building = false
+	stopHover()
+end
+
+local function onBlockAdded(block, run)
+	register(block)
+	local added = os.clock()
+	task.delay(0.15, function()
+		if not Enabled or run ~= RunId then return end
+		if building or (added >= buildStart and added <= buildEnd) then return end
+		local key = block:GetAttribute("CellKey")
+		if not key or not key:match(KEY_PATTERN) then return end
+		task.spawn(runBuild, key, run)
+	end)
+end
+
+local function disconnectAll()
+	for _, c in ipairs(conns) do c:Disconnect() end
+	conns = {}
+end
+
+-- ===== auto break grass =====
+local breakingOn = false
+local breakRun = 0
+
+local function startBreaking()
+	breakRun += 1
+	local run = breakRun
+	local function active() return breakingOn and run == breakRun end
+
+	task.spawn(function()
+		local blocks = findBlocksFolder()
+		if not blocks then return end
+		local Swing = RS:WaitForChild("Remotes"):WaitForChild("RequestSwing")
+		local params = OverlapParams.new()
+		params.FilterType = Enum.RaycastFilterType.Include
+		params.FilterDescendantsInstances = { blocks }
+
+		local function grassNear(pos)
+			local list = {}
+			for _, part in ipairs(workspace:GetPartBoundsInRadius(pos, CFG.BreakRange, params)) do
+				if part.Parent == blocks and part:GetAttribute("BlockId") == "GrassBlock" then
+					list[#list + 1] = { part = part, dist = (part.Position - pos).Magnitude }
+				end
+			end
+			table.sort(list, function(a, b) return a.dist < b.dist end)
+			return list
+		end
+
+		local function nearestGrass(pos)
+			local best, bestDist
+			for _, b in ipairs(blocks:GetChildren()) do
+				if b:IsA("BasePart") and b:GetAttribute("BlockId") == "GrassBlock" then
+					local d = (b.Position - pos).Magnitude
+					if not bestDist or d < bestDist then best, bestDist = b, d end
+				end
+			end
+			return best
+		end
+
+		while active() do
+			if building then task.wait(0.5) else
+				local hum, root = getChar()
+				if not hum then task.wait(0.5) else
+					local origin = hoverCF and hoverCF.Position or root.Position
+					local list = grassNear(origin)
+					if #list > 0 then
+						startHover(hum, root)
+						for i = 1, math.min(#list, 40) do
+							if not active() then break end
+							local part = list[i].part
+							if part.Parent == blocks then
+								Swing:FireServer(part)
+								task.wait(CFG.SwingDelay)
+							end
+						end
+					else
+						local target = nearestGrass(origin)
+						if not target then break end
+						glideActive(target.Position + Vector3.new(0, CFG.HoverHeight + 2, 0), active)
+					end
+				end
+			end
+			task.wait()
+		end
+		if not building then stopHover() end
+	end)
+end
+
+-- ===== UI =====
+Tab:CreateToggle(dual({
+	name = "Auto Builder",
+	flag = "AutoBuilder",
+	currentValue = false,
+	callback = function(on)
+		Enabled = on
+		RunId += 1
+		disconnectAll()
+		if not on then return end
+
+		BlocksFolder = findBlocksFolder()
+		if not BlocksFolder then return end
+
+		occupied, blockKey = {}, {}
+		for _, block in ipairs(BlocksFolder:GetChildren()) do register(block) end
+
+		local run = RunId
+		table.insert(conns, BlocksFolder.ChildAdded:Connect(function(block) onBlockAdded(block, run) end))
+		table.insert(conns, BlocksFolder.ChildRemoved:Connect(unregister))
+		notify("Fortress Builder on", "Place a GrassBlock in the center.")
+	end,
+}))
+
+Tab:CreateToggle(dual({
+	name = "Auto Break Grass",
+	flag = "AutoBreakGrass",
+	currentValue = false,
+	callback = function(on)
+		breakingOn = on
+		if on then startBreaking() else breakRun += 1 end
+	end,
+}))
+
+pcall(function()
+	Tab:CreateSlider(dual({
+		name = "Break Speed",
+		flag = "BreakSpeed",
+		range = { 0.05, 1 },
+		increment = 0.05,
+		suffix = " s",
+		currentValue = CFG.SwingDelay,
+		callback = function(v) CFG.SwingDelay = v end,
+	}))
+	
+	Tab:CreateSlider(dual({
+		name = "Place Delay",
+		flag = "BuilderDelay",
+		range = { 0.03, 1 },
+		increment = 0.01,
+		suffix = " s",
+		currentValue = CFG.PlaceDelay,
+		callback = function(v) CFG.PlaceDelay = v end,
+	}))
+end)
+
+notify("VANTA Fortress Builder", "Loaded. Place a block at the center.")
