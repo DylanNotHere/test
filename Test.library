@@ -1,4 +1,4 @@
--- autobuilder_v7.1.0 (Hollow Shell Fortress: connected cliff shell + auto-fit to your block limit)
+-- autobuilder_v7.1.0 (Fixed Hollow Shell)
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -30,11 +30,7 @@ local CFG = {
 	GlideSpeed = 30,
 	HoverHeight = 4,
 	TerrainRadius = 60, -- 120x120 diameter
-	FlatRadius = 45,    -- the flat grass middle
-	CliffHeight = 15,   -- how high the cliff ring rises above the middle
-	Skirt = 3,          -- extra stone blocks hanging under the outer edge so the cliff looks solid from outside
-	AutoFit = true,     -- shrink the whole thing to fit the block room you have left
-	BlockCap = 14000,   -- your island's block limit (used if the counter on screen can't be read)
+	FlatRadius = 45,    -- The middle flat grass area
 	BreakRange = 15,
 	SwingDelay = 0.2,
 }
@@ -54,156 +50,51 @@ end
 
 local function notify(title, content)
 	pcall(function()
-		Rayfield:Notify(dual({ title = title, content = content, duration = 5 }))
+		Rayfield:Notify(dual({ title = title, content = content, duration = 4 }))
 	end)
 end
 
 -- ==================================================
--- PROCEDURAL GENERATOR (connected hollow shell)
+-- PROCEDURAL GENERATOR (Fixed Hollow Shell)
 -- ==================================================
--- Why the old one stopped: it put ONE block per column of the cliff ring at a random height, so neighbouring
--- blocks sat several levels apart and never touched face to face. The builder can only place a block next to
--- one that already exists, so after the flat middle it had nothing left to reach.
--- Now every column gets its top block PLUS a short wall of blocks down to each lower neighbour's top, so the
--- shell is one connected surface. The inside stays empty, and the noise is deterministic (same shape every run).
-
-local function hash2(x, z, salt)
-	local n = math.sin(x * 127.1 + z * 311.7 + (salt or 0) * 74.7) * 43758.5453
-	return n - math.floor(n)
-end
-
-local function colKey(x, z)
-	return (x + 512) * 1024 + (z + 512)
-end
-
-local function terrainBlueprint(sx, sy, sz, R, F, H)
-	R, F, H = R or CFG.TerrainRadius, F or CFG.FlatRadius, H or CFG.CliffHeight
-
-	-- height of every column (0 = ground level of the flat middle)
-	local top = {}
-	for x = -R, R do
-		for z = -R, R do
-			local d = math.sqrt(x * x + z * z)
-			if d <= R then
-				local T = 0
-				if d > F then
-					local t = (d - F) / (R - F)
-					local base = math.floor(H * t ^ 1.5)
-					local n = math.floor(hash2(math.floor(x / 4), math.floor(z / 4)) * 3) - 1 -- -1..1 in 4x4 patches
-					T = math.max(0, base + n)
-				end
-				top[colKey(x, z)] = T
-			end
-		end
-	end
-
+local function terrainBlueprint(sx, sy, sz)
 	local cells = {}
-	local function put(x, y, z, id)
-		local wx, wy, wz = sx + x, sy + y, sz + z
-		local key = fmt(wx, wy, wz)
-		if not cells[key] then
-			cells[key] = { wx, wy, wz, id }
-		end
-	end
+	local radius = CFG.TerrainRadius
+	local flatRadius = CFG.FlatRadius
 
-	for x = -R, R do
-		for z = -R, R do
-			local T = top[colKey(x, z)]
-			if T then
-				local d = math.sqrt(x * x + z * z)
-				put(x, T, z, d <= F and "GrassBlock" or "StoneBrick") -- the surface
+	for x = -radius, radius do
+		for z = -radius, radius do
+			local dist = math.sqrt(x*x + z*z)
+			
+			if dist <= radius then
+				local wx = sx + x
+				local wz = sz + z
+				
+				if dist <= flatRadius then
+					-- FLAT GRASS CENTER (1 block thick)
+					cells[fmt(wx, sy, wz)] = {wx, sy, wz, "GrassBlock"}
+				else
+					-- CLIFF EDGE (Hollow Shell)
+					local heightMultiplier = (dist - flatRadius) / (radius - flatRadius)
+					
+					-- Calculate a fixed height based on distance so it doesn't randomly change
+					local cliffHeight = math.floor(12 * (heightMultiplier ^ 1.2))
+					if dist > radius - 3 then cliffHeight = cliffHeight - 2 end -- taper the edge
+					
+					local topY = sy + cliffHeight
 
-				local rim = false
-				for _, dd in ipairs(HORIZONTAL) do
-					local nT = top[colKey(x + dd[1], z + dd[2])]
-					if nT then
-						if nT < T then
-							-- wall down to the lower neighbour's top, so the two columns touch
-							for y = nT, T - 1 do
-								put(x, y, z, hash2(x, z, y) < 0.25 and "StoneBrick" or "StoneBlock")
-							end
-						end
-					else
-						rim = true
-					end
-				end
-
-				if rim then
-					for i = 1, CFG.Skirt do
-						put(x, T - i, z, "StoneBlock")
+					-- FILL FROM TOP TO BOTTOM (Ensures the snake never gets stuck in the air)
+					for wy = topY, sy, -1 do
+						local blockType = "StoneBlock"
+						if wy == topY then blockType = "StoneBrick" end
+						
+						cells[fmt(wx, wy, wz)] = {wx, wy, wz, blockType}
 					end
 				end
 			end
 		end
 	end
 	return cells
-end
-
-local function countCells(t)
-	local n = 0
-	for _ in pairs(t) do n += 1 end
-	return n
-end
-
--- ===== block limit: read the counter on screen ("13877 / 14000") =====
-local function readBlockCounter()
-	local pg = player:FindFirstChild("PlayerGui")
-	if not pg then return end
-	for _, d in ipairs(pg:GetDescendants()) do
-		if d:IsA("TextLabel") then
-			local a, b = d.Text:match("^%s*([%d,]+)%s*/%s*([%d,]+)%s*$")
-			if a and b then
-				local used = tonumber((a:gsub(",", "")))
-				local cap = tonumber((b:gsub(",", "")))
-				if used and cap and cap >= 1000 and used <= cap then
-					return used, cap
-				end
-			end
-		end
-	end
-end
-
--- shrink the whole shape (radius, flat middle and cliff height together) until it fits the room you have left
-local function fittedBlueprint(sx, sy, sz, room)
-	local R, F, H = CFG.TerrainRadius, CFG.FlatRadius, CFG.CliffHeight
-	local bp = terrainBlueprint(sx, sy, sz, R, F, H)
-	local n = countCells(bp)
-	if not CFG.AutoFit or n <= room then
-		return bp, n, 1
-	end
-
-	local lo, hi = 0.3, 1.0
-	local best, bestN, bestS
-	for _ = 1, 8 do
-		local mid = (lo + hi) / 2
-		local cand = terrainBlueprint(sx, sy, sz,
-			math.max(8, math.floor(R * mid + 0.5)),
-			math.max(4, math.floor(F * mid + 0.5)),
-			math.max(3, math.floor(H * mid + 0.5)))
-		local cn = countCells(cand)
-		if cn <= room then
-			best, bestN, bestS, lo = cand, cn, mid, mid
-		else
-			hi = mid
-		end
-	end
-	if not best then
-		best = terrainBlueprint(sx, sy, sz,
-			math.max(8, math.floor(R * 0.3 + 0.5)), math.max(4, math.floor(F * 0.3 + 0.5)), 3)
-		bestN, bestS = countCells(best), 0.3
-	end
-	return best, bestN, bestS
-end
-
--- ===== what you own (to warn about missing stone) =====
-local inventory
-do
-	local inv = RS:WaitForChild("Remotes"):FindFirstChild("InventoryChanged")
-	if inv then
-		inv.OnClientEvent:Connect(function(items)
-			if type(items) == "table" then inventory = items end
-		end)
-	end
 end
 
 -- ===== state =====
@@ -327,15 +218,8 @@ local function build(seedKey, run)
 	sx, sy, sz = tonumber(sx), tonumber(sy), tonumber(sz)
 	if not sx then return end
 
-	-- how many blocks can still be placed
-	local used, cap = readBlockCounter()
-	if not used then
-		used, cap = countCells(occupied), CFG.BlockCap
-	end
-	local room = cap - used - 20
-
-	local blueprint, planned, scale = fittedBlueprint(sx, sy, sz, room)
-
+	local blueprint = terrainBlueprint(sx, sy, sz)
+	
 	local pending, total, counts = {}, 0, {}
 	for key, c in pairs(blueprint) do
 		if not occupied[key] then
@@ -350,30 +234,7 @@ local function build(seedKey, run)
 		materials[#materials + 1] = ("%dx %s"):format(n, id)
 	end
 	table.sort(materials)
-	print(("[Builder] fortress from %s: %d blocks (%s), room for %d, scale %.0f%%"):format(
-		seedKey, total, table.concat(materials, ", "), room, scale * 100))
-
-	if scale < 1 then
-		notify("Scaled to fit", ("Your block limit has room for %d, so the fortress is %.0f%% of full size (%d blocks)."):format(
-			room, scale * 100, total))
-	else
-		notify("Building the Shell", ("%d blocks: %s"):format(total, table.concat(materials, ", ")))
-	end
-
-	-- warn if you don't own enough stone for it
-	if inventory then
-		local short = {}
-		for id, n in pairs(counts) do
-			if id ~= "GrassBlock" and (inventory[id] or 0) < n then
-				short[#short + 1] = ("%s: need %d, own %d"):format(id, n, inventory[id] or 0)
-			end
-		end
-		if #short > 0 then
-			table.sort(short)
-			warn("[Builder] not enough: " .. table.concat(short, "; "))
-			notify("Not enough blocks", table.concat(short, "; "))
-		end
-	end
+	notify("Building the Shell", ("%d blocks: %s"):format(total, table.concat(materials, ", ")))
 
 	local frontierByY = {}
 	local function addFrontier(key, c)
@@ -500,20 +361,12 @@ local function build(seedKey, run)
 			local b = occupied[key]
 			if b and b.Parent then glideAbove(blockPos(b), CFG.HoverHeight, run) end
 			delay = math.max(CFG.PlaceDelay, delay * 0.95)
-			if placed % 250 == 0 then
-				print(("[Builder] %d / %d placed"):format(placed, total))
-			end
 		else
 			failed += 1
 			finish(key)
 		end
 		task.wait(delay)
 	end
-
-	local left = 0
-	for _ in pairs(pending) do left += 1 end
-	print(("[Builder] done: %d placed, %d failed, %d not reachable"):format(placed, failed, left))
-	notify("Fortress finished", ("%d placed, %d skipped"):format(placed, failed + left))
 end
 
 local function runBuild(seedKey, run)
@@ -523,9 +376,6 @@ local function runBuild(seedKey, run)
 	buildEnd = os.clock()
 	building = false
 	stopHover()
-	if not ok then
-		warn("[Builder] error: " .. tostring(err))
-	end
 end
 
 local function onBlockAdded(block, run)
@@ -633,7 +483,7 @@ Tab:CreateToggle(dual({
 		local run = RunId
 		table.insert(conns, BlocksFolder.ChildAdded:Connect(function(block) onBlockAdded(block, run) end))
 		table.insert(conns, BlocksFolder.ChildRemoved:Connect(unregister))
-		notify("Cliff Builder on", "Place a GrassBlock in the center (that's ground level).")
+		notify("Cliff Builder on", "Place a GrassBlock in the center.")
 	end,
 }))
 
@@ -657,7 +507,7 @@ pcall(function()
 		currentValue = CFG.SwingDelay,
 		callback = function(v) CFG.SwingDelay = v end,
 	}))
-
+	
 	Tab:CreateSlider(dual({
 		name = "Place Delay",
 		flag = "BuilderDelay",
