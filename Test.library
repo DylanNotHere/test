@@ -1,4 +1,4 @@
--- autobuilder_v5.4.0 (120x120 Fortress with Exact IDs)
+-- autobuilder_v7.0.0 (Hollow Shell Fortress)
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -16,9 +16,9 @@ local function dual(t)
 end
 
 local Window = Rayfield:CreateWindow(dual({
-	name = "VANTA | Fortress Builder",
+	name = "VANTA | Hollow Fortress",
 	loadingTitle = "VANTA",
-	loadingSubtitle = "120x120 Fortress",
+	loadingSubtitle = "120x120 Shell",
 }))
 local Tab = Window:CreateTab(dual({ name = "Builder" }))
 
@@ -29,7 +29,8 @@ local CFG = {
 	MaxRetries = 4,
 	GlideSpeed = 30,
 	HoverHeight = 4,
-	TerrainRadius = 60,
+	TerrainRadius = 60, -- 120x120 diameter
+	FlatRadius = 45,    -- The middle flat grass area
 	BreakRange = 15,
 	SwingDelay = 0.2,
 }
@@ -54,13 +55,12 @@ local function notify(title, content)
 end
 
 -- ==================================================
--- PROCEDURAL GENERATOR (120x120 Fortress Wall)
+-- PROCEDURAL GENERATOR (Hollow Shell)
 -- ==================================================
 local function terrainBlueprint(sx, sy, sz)
 	local cells = {}
 	local radius = CFG.TerrainRadius
-	local flatRadius = 50 -- Flat area radius
-	local wallThickness = 5 -- How thick the wall base is
+	local flatRadius = CFG.FlatRadius
 
 	for x = -radius, radius do
 		for z = -radius, radius do
@@ -71,35 +71,36 @@ local function terrainBlueprint(sx, sy, sz)
 				local wz = sz + z
 				
 				if dist <= flatRadius then
-					-- FLAT GRASS CENTER
-					local wy = sy
-					cells[fmt(wx, wy, wz)] = {wx, wy, wz, "GrassBlock"}
-					-- Dirt underneath
-					for by = wy - 1, sy - 5, -1 do
-						cells[fmt(wx, by, wz)] = {wx, by, wz, "DirtBlock"}
-					end
+					-- FLAT GRASS CENTER (1 block thick)
+					cells[fmt(wx, sy, wz)] = {wx, sy, wz, "GrassBlock"}
 				else
-					-- CLIFF EDGE & WALL
-					-- Step up the ground gradually
-					local yOffset = math.floor((dist - flatRadius) / 2)
-					local groundY = sy + yOffset
+					-- NATURAL CLIFF EDGE (Hollow shell)
+					local heightMultiplier = (dist - flatRadius) / (radius - flatRadius)
+					local cliffHeight = math.floor(15 * (heightMultiplier ^ 1.5))
 					
-					-- Build base ground (Normal Stone)
-					for by = groundY, sy - 5, -1 do
-						cells[fmt(wx, by, wz)] = {wx, by, wz, "StoneBlock"}
-					end
+					local noise = math.random(-2, 2) 
+					if dist > (radius - 3) then noise = noise - 3 end
+					
+					local topY = sy + cliffHeight + noise
+					
+					-- Make it 2 blocks thick at the very edge so it looks solid from outside, 
+					-- but hollow inside.
+					local thickness = 2
+					if dist < radius - 3 then thickness = 1 end
 
-					-- Build the vertical wall (Shell)
-					if dist > (radius - wallThickness) then
-						local wallHeight = 10 + math.random(0, 3) -- 10-13 blocks high
-						
-						for wy = groundY + 1, groundY + wallHeight do
-							-- Mix StoneBrick and StoneBlock for a ruined fortress look
-							local blockType = "StoneBrick"
-							if math.random(1, 100) <= 30 then blockType = "StoneBlock" end
-							if wy == groundY + wallHeight then blockType = "StoneBrick" end -- Flat top
+					for t = 0, thickness - 1 do
+						local currentDist = dist - t
+						if currentDist > flatRadius then
+							local blockType = "StoneBlock"
+							if t == 0 then blockType = "StoneBrick" -- Outer layer is brick
+							elseif math.random(1, 100) <= 25 then blockType = "StoneBrick" end
 							
-							cells[fmt(wx, wy, wz)] = {wx, wy, wz, blockType}
+							-- Calculate the X and Z offset to push the inner wall inwards
+							local angle = math.atan2(z, x)
+							local innerX = wx - math.floor(math.cos(angle) * t)
+							local innerZ = wz - math.floor(math.sin(angle) * t)
+							
+							cells[fmt(innerX, topY, innerZ)] = {innerX, topY, innerZ, blockType}
 						end
 					end
 				end
@@ -107,31 +108,6 @@ local function terrainBlueprint(sx, sy, sz)
 		end
 	end
 	return cells
-end
-
--- ===== what you own =====
-local inventory
-do
-	local inv = RS:WaitForChild("Remotes"):FindFirstChild("InventoryChanged")
-	if inv then
-		inv.OnClientEvent:Connect(function(items)
-			if type(items) == "table" then inventory = items end
-		end)
-	end
-end
-
-local function resolveDirt(blueprint)
-	local dirt = {}
-	for _, c in pairs(blueprint) do
-		if c[4] == "DirtBlock" then dirt[#dirt + 1] = c end
-	end
-	if #dirt == 0 then return end
-	if not inventory then task.wait(1.5) end
-	local have = inventory and (inventory["DirtBlock"] or 0) or math.huge
-	if have >= #dirt then return end
-	for i, c in ipairs(dirt) do
-		if i > have then c[4] = "GrassBlock" end
-	end
 end
 
 -- ===== state =====
@@ -256,8 +232,7 @@ local function build(seedKey, run)
 	if not sx then return end
 
 	local blueprint = terrainBlueprint(sx, sy, sz)
-	resolveDirt(blueprint)
-
+	
 	local pending, total, counts = {}, 0, {}
 	for key, c in pairs(blueprint) do
 		if not occupied[key] then
@@ -272,7 +247,7 @@ local function build(seedKey, run)
 		materials[#materials + 1] = ("%dx %s"):format(n, id)
 	end
 	table.sort(materials)
-	notify("Building the Fortress", ("%d blocks: %s"):format(total, table.concat(materials, ", ")))
+	notify("Building the Shell", ("%d blocks: %s"):format(total, table.concat(materials, ", ")))
 
 	local frontierByY = {}
 	local function addFrontier(key, c)
@@ -521,7 +496,7 @@ Tab:CreateToggle(dual({
 		local run = RunId
 		table.insert(conns, BlocksFolder.ChildAdded:Connect(function(block) onBlockAdded(block, run) end))
 		table.insert(conns, BlocksFolder.ChildRemoved:Connect(unregister))
-		notify("Fortress Builder on", "Place a GrassBlock in the center.")
+		notify("Cliff Builder on", "Place a GrassBlock in the center.")
 	end,
 }))
 
@@ -557,4 +532,4 @@ pcall(function()
 	}))
 end)
 
-notify("VANTA Fortress Builder", "Loaded. Place a block at the center.")
+notify("VANTA Cliff Builder", "Loaded. Hollow Fortress.")
