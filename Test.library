@@ -1,6 +1,6 @@
 --==================================================
--- VANTA | AUTOFARM v2.3.0
--- Ore/Tree hover below, Mobs hover front, Boss hover above
+-- VANTA | AUTOFARM v2.4.0
+-- Mobs & Ores below, Boss above
 --==================================================
 
 local Players = game:GetService("Players")
@@ -27,11 +27,10 @@ local Tab = Window:CreateTab({ name = "Farm" })
 
 local CFG = {
     GlideSpeed = 40,
-    HoverHeight = 12,        -- Default height (unused for mobs/ores now)
+    HoverHeight = 12,        -- Default (unused)
     BossHoverHeight = 15,    -- Morten height
-    MobHoverHeight = 6,      -- Skeleton height
-    MobFrontDistance = 4,    -- How many studs in front of the mob
-    NodeHoverHeight = -5,    -- Ores/Trees height (negative = below)
+    MobHoverHeight = -5,     -- Skeleton height (below)
+    NodeHoverHeight = -5,    -- Ores/Trees height (below)
     SwingRange = 16,
 
     MobSwing = 0.36,
@@ -309,13 +308,8 @@ local function engage(model, isMob)
 
         local goal
         if isMob and not bossNames[model.Name] then
-            -- Skeleton: Tween in front
-            local mobRoot = model:FindFirstChild("HumanoidRootPart")
-            if mobRoot then
-                goal = mobRoot.Position + (mobRoot.CFrame.LookVector * CFG.MobFrontDistance) + Vector3.new(0, CFG.MobHoverHeight, 0)
-            else
-                goal = targetPos(model, isMob) + Vector3.new(0, CFG.MobHoverHeight, 0)
-            end
+            -- Mob: Tween below
+            goal = targetPos(model, isMob) + Vector3.new(0, CFG.MobHoverHeight, 0)
         elseif not isMob then
             -- Ore/Tree: Tween below
             goal = targetPos(model, isMob) + Vector3.new(0, CFG.NodeHoverHeight, 0)
