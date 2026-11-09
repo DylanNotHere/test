@@ -1,6 +1,6 @@
 --==================================================
--- VANTA | AUTO BREAK STONE (v1.4.0)
--- Targets StoneBrick and StoneBlock
+-- VANTA | AUTO BREAK STONE (v1.5.0)
+-- High-Speed Burst Breaking
 --==================================================
 
 --// RAYFIELD
@@ -19,10 +19,10 @@ local SwingRemote = RS:WaitForChild("Remotes"):WaitForChild("RequestSwing")
 
 --// CONFIG
 local CFG = {
-    BreakSpeed = 0.2,
-    GlideSpeed = 12,
+    BreakSpeed = 0.05, -- Lowered default speed
+    GlideSpeed = 25,   -- Made gliding faster too
     HoverHeight = 6,
-    BreakRange = 15,
+    BreakRange = 20,   -- Increased range slightly to hit more at once
     MoveRange = 5,
     HoldForce = 1000000000,
 }
@@ -64,11 +64,10 @@ local function getBlocks()
     return fallback
 end
 
---// VALID BLOCK (NEW FILTER)
+--// VALID BLOCK
 local function validBlock(block)
     if not block or not block.Parent then return false end
     local id = block:GetAttribute("BlockId")
-    -- Only target StoneBrick and StoneBlock
     return id == "StoneBrick" or id == "StoneBlock"
 end
 
@@ -160,7 +159,7 @@ local function glideTo(block)
 
     local destination = target + direction * CFG.MoveRange + Vector3.new(0, CFG.HoverHeight, 0)
     local distance = (bodyPosition.Position - destination).Magnitude
-    local duration = math.max(distance / CFG.GlideSpeed, 0.5)
+    local duration = math.max(distance / CFG.GlideSpeed, 0.2) -- Faster minimum glide time
 
     if currentTween then currentTween:Cancel(); currentTween = nil end
 
@@ -176,7 +175,7 @@ local function glideTo(block)
     return enabled and result == Enum.PlaybackState.Completed
 end
 
---// BREAK BLOCKS WHILE HOVERING
+--// BREAK BLOCKS WHILE HOVERING (BURST MODE)
 local function breakNearby(blocks)
     while enabled do
         if not startHover() then return end
@@ -184,7 +183,7 @@ local function breakNearby(blocks)
         local _, _, root = getChar()
         if not root then return end
 
-        local found = false
+        local foundAny = false
 
         for _, block in ipairs(blocks:GetChildren()) do
             if not enabled then return end
@@ -192,17 +191,21 @@ local function breakNearby(blocks)
             if validBlock(block) then
                 local pos = blockPosition(block)
                 if pos and (root.Position - pos).Magnitude <= CFG.BreakRange then
-                    found = true
+                    foundAny = true
+                    
+                    -- Fire instantly without waiting for the block to break
                     pcall(function()
                         SwingRemote:FireServer(block)
                     end)
+                    
+                    -- Tiny yield just to prevent the script from freezing
                     task.wait(CFG.BreakSpeed)
                 end
             end
         end
 
-        if not found then break end
-        task.wait(0.1)
+        if not foundAny then break end
+        task.wait(0.05)
     end
 end
 
@@ -247,12 +250,12 @@ local function start()
                         end
                     end
                 else
-                    task.wait(0.5)
+                    task.wait(0.2)
                 end
             else
                 task.wait(1)
             end
-            task.wait(0.05)
+            task.wait(0.02)
         end
         stopHover()
         running = false
@@ -287,8 +290,8 @@ Tab:CreateToggle({
 Tab:CreateSlider({
     name = "Break Speed",
     flag = "BreakSpeed",
-    range = {0.05, 1},
-    increment = 0.05,
+    range = {0.01, 1}, -- Lowered minimum to 0.01
+    increment = 0.01,
     suffix = " s",
     currentValue = CFG.BreakSpeed,
     callback = function(value)
