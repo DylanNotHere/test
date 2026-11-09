@@ -1,4 +1,4 @@
--- autobuilder_v5.2.0 (120x120 Fortress with StoneBrick)
+-- autobuilder_v5.4.0 (120x120 Fortress with Exact IDs)
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -29,7 +29,7 @@ local CFG = {
 	MaxRetries = 4,
 	GlideSpeed = 30,
 	HoverHeight = 4,
-	TerrainRadius = 60, -- 60 = 120x120 diameter
+	TerrainRadius = 60,
 	BreakRange = 15,
 	SwingDelay = 0.2,
 }
@@ -86,7 +86,7 @@ local function terrainBlueprint(sx, sy, sz)
 					
 					-- Build base ground (Normal Stone)
 					for by = groundY, sy - 5, -1 do
-						cells[fmt(wx, by, wz)] = {wx, by, wz, "Stone"}
+						cells[fmt(wx, by, wz)] = {wx, by, wz, "StoneBlock"}
 					end
 
 					-- Build the vertical wall (Shell)
@@ -94,9 +94,9 @@ local function terrainBlueprint(sx, sy, sz)
 						local wallHeight = 10 + math.random(0, 3) -- 10-13 blocks high
 						
 						for wy = groundY + 1, groundY + wallHeight do
-							-- Mix StoneBrick and Stone for a ruined fortress look
+							-- Mix StoneBrick and StoneBlock for a ruined fortress look
 							local blockType = "StoneBrick"
-							if math.random(1, 100) <= 30 then blockType = "Stone" end
+							if math.random(1, 100) <= 30 then blockType = "StoneBlock" end
 							if wy == groundY + wallHeight then blockType = "StoneBrick" end -- Flat top
 							
 							cells[fmt(wx, wy, wz)] = {wx, wy, wz, blockType}
