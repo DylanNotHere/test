@@ -1,522 +1,297 @@
--- autobuilder_v7.1.0 (Fixed Hollow Shell)
+--==================================================
+-- VANTA | AUTO BREAK STONE (v1.4.0)
+-- Targets StoneBrick and StoneBlock
+--==================================================
+
+--// RAYFIELD
+local Rayfield = loadstring(game:HttpGet(
+    "https://sirius.menu/gen2"
+))()
+
+--// SERVICES
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-local player = Players.LocalPlayer
+local TweenService = game:GetService("TweenService")
 
-local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+--// PLAYER
+local Player = Players.LocalPlayer
+local SwingRemote = RS:WaitForChild("Remotes"):WaitForChild("RequestSwing")
 
-local function dual(t)
-	local out = {}
-	for k, v in pairs(t) do
-		out[k] = v
-		out[k:sub(1, 1):upper() .. k:sub(2)] = v
-	end
-	return out
-end
-
-local Window = Rayfield:CreateWindow(dual({
-	name = "VANTA | Hollow Fortress",
-	loadingTitle = "VANTA",
-	loadingSubtitle = "120x120 Shell",
-}))
-local Tab = Window:CreateTab(dual({ name = "Builder" }))
-
+--// CONFIG
 local CFG = {
-	PlaceDelay = 0.1,
-	MaxDelay = 1.0,
-	CheckTimeout = 3,
-	MaxRetries = 4,
-	GlideSpeed = 30,
-	HoverHeight = 4,
-	TerrainRadius = 60, -- 120x120 diameter
-	FlatRadius = 45,    -- The middle flat grass area
-	BreakRange = 15,
-	SwingDelay = 0.2,
+    BreakSpeed = 0.2,
+    GlideSpeed = 12,
+    HoverHeight = 6,
+    BreakRange = 15,
+    MoveRange = 5,
+    HoldForce = 1000000000,
 }
 
-local FIXED_NORMAL = Vector3.new(-1, 0, 0)
-local KEY_PATTERN = "^(-?%d+),(-?%d+),(-?%d+)$"
-local DIRS = {
-	{ 1, 0, 0 }, { -1, 0, 0 },
-	{ 0, 1, 0 }, { 0, -1, 0 },
-	{ 0, 0, 1 }, { 0, 0, -1 },
-}
-local HORIZONTAL = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }
+--// STATE
+local enabled = false
+local running = false
 
-local function fmt(x, y, z)
-	return string.format("%d,%d,%d", x, y, z)
-end
+local currentTween
+local bodyPosition
+local bodyGyro
+local activeRoot
+local activeHumanoid
 
-local function notify(title, content)
-	pcall(function()
-		Rayfield:Notify(dual({ title = title, content = content, duration = 4 }))
-	end)
-end
-
--- ==================================================
--- PROCEDURAL GENERATOR (Fixed Hollow Shell)
--- ==================================================
-local function terrainBlueprint(sx, sy, sz)
-	local cells = {}
-	local radius = CFG.TerrainRadius
-	local flatRadius = CFG.FlatRadius
-
-	for x = -radius, radius do
-		for z = -radius, radius do
-			local dist = math.sqrt(x*x + z*z)
-			
-			if dist <= radius then
-				local wx = sx + x
-				local wz = sz + z
-				
-				if dist <= flatRadius then
-					-- FLAT GRASS CENTER (1 block thick)
-					cells[fmt(wx, sy, wz)] = {wx, sy, wz, "GrassBlock"}
-				else
-					-- CLIFF EDGE (Hollow Shell)
-					local heightMultiplier = (dist - flatRadius) / (radius - flatRadius)
-					
-					-- Calculate a fixed height based on distance so it doesn't randomly change
-					local cliffHeight = math.floor(12 * (heightMultiplier ^ 1.2))
-					if dist > radius - 3 then cliffHeight = cliffHeight - 2 end -- taper the edge
-					
-					local topY = sy + cliffHeight
-
-					-- FILL FROM TOP TO BOTTOM (Ensures the snake never gets stuck in the air)
-					for wy = topY, sy, -1 do
-						local blockType = "StoneBlock"
-						if wy == topY then blockType = "StoneBrick" end
-						
-						cells[fmt(wx, wy, wz)] = {wx, wy, wz, blockType}
-					end
-				end
-			end
-		end
-	end
-	return cells
-end
-
--- ===== state =====
-local Enabled = false
-local RunId = 0
-local building = false
-local buildStart, buildEnd = math.huge, 0
-
-local BlocksFolder
-local occupied = {}
-local blockKey = {}
-local conns = {}
-
-local function findBlocksFolder()
-	local fallback
-	for _, island in ipairs(workspace:GetChildren()) do
-		if island.Name:match("^Island_") then
-			local blocks = island:FindFirstChild("Blocks")
-			if blocks then
-				if island.Name:find(tostring(player.UserId), 1, true) then return blocks end
-				fallback = fallback or blocks
-			end
-		end
-	end
-	return fallback
-end
-
-local function register(block)
-	local key = block:GetAttribute("CellKey")
-	if key then
-		occupied[key] = block
-		blockKey[block] = key
-		return
-	end
-	local conn
-	conn = block:GetAttributeChangedSignal("CellKey"):Connect(function()
-		local k = block:GetAttribute("CellKey")
-		if k then
-			occupied[k] = block
-			blockKey[block] = k
-			conn:Disconnect()
-		end
-	end)
-	task.delay(3, function() if conn.Connected then conn:Disconnect() end end)
-end
-
-local function unregister(block)
-	local key = blockKey[block]
-	if key then
-		if occupied[key] == block then occupied[key] = nil end
-		blockKey[block] = nil
-	end
-end
-
-local function blockPos(b)
-	if b:IsA("BasePart") then return b.Position end
-	return b:GetPivot().Position
-end
-
+--// CHARACTER
 local function getChar()
-	local char = player.Character
-	if not char then return end
-	local hum = char:FindFirstChildOfClass("Humanoid")
-	local root = char:FindFirstChild("HumanoidRootPart")
-	if hum and root and hum.Health > 0 then return hum, root end
+    local char = Player.Character
+    if not char then return end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not humanoid or not root then return end
+    return char, humanoid, root
 end
 
-local hoverCF, hoverConn
-local function startHover(hum, root)
-	if hoverConn then return end
-	hoverCF = root.CFrame
-	hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
-	hoverConn = RunService.Heartbeat:Connect(function()
-		if root.Parent then
-			root.CFrame = hoverCF
-			root.AssemblyLinearVelocity = Vector3.zero
-			if hum:GetState() == Enum.HumanoidStateType.Freefall then
-				hum:ChangeState(Enum.HumanoidStateType.Running)
-			end
-		end
-	end)
+--// FIND ISLAND BLOCKS
+local function getBlocks()
+    local fallback
+    for _, island in ipairs(workspace:GetChildren()) do
+        if island.Name:match("^Island_") then
+            local blocks = island:FindFirstChild("Blocks")
+            if blocks then
+                if island.Name:find(tostring(Player.UserId), 1, true) then
+                    return blocks
+                end
+                fallback = fallback or blocks
+            end
+        end
+    end
+    return fallback
 end
 
+--// VALID BLOCK (NEW FILTER)
+local function validBlock(block)
+    if not block or not block.Parent then return false end
+    local id = block:GetAttribute("BlockId")
+    -- Only target StoneBrick and StoneBlock
+    return id == "StoneBrick" or id == "StoneBlock"
+end
+
+--// BLOCK POSITION
+local function blockPosition(block)
+    if block:IsA("BasePart") then
+        return block.Position
+    elseif block:IsA("Model") then
+        return block:GetPivot().Position
+    end
+end
+
+--// NEAREST BLOCK
+local function nearestBlock(blocks, root)
+    local nearest
+    local shortest = math.huge
+
+    for _, block in ipairs(blocks:GetChildren()) do
+        if validBlock(block) then
+            local pos = blockPosition(block)
+            if pos then
+                local distance = (root.Position - pos).Magnitude
+                if distance < shortest then
+                    shortest = distance
+                    nearest = block
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+--// START PERMANENT HOVER
+local function startHover()
+    local _, humanoid, root = getChar()
+    if not root or not humanoid then return false end
+
+    if activeRoot == root and bodyPosition and bodyPosition.Parent then
+        return true
+    end
+
+    if bodyPosition then bodyPosition:Destroy(); bodyPosition = nil end
+    if bodyGyro then bodyGyro:Destroy(); bodyGyro = nil end
+
+    activeRoot = root
+    activeHumanoid = humanoid
+
+    humanoid.AutoRotate = false
+    humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+
+    bodyPosition = Instance.new("BodyPosition")
+    bodyPosition.Name = "VANTA_Hover"
+    bodyPosition.Position = root.Position + Vector3.new(0, CFG.HoverHeight, 0)
+    bodyPosition.MaxForce = Vector3.new(CFG.HoldForce, CFG.HoldForce, CFG.HoldForce)
+    bodyPosition.P = 15000
+    bodyPosition.D = 1500
+    bodyPosition.Parent = root
+
+    bodyGyro = Instance.new("BodyGyro")
+    bodyGyro.Name = "VANTA_HoverRotation"
+    bodyGyro.CFrame = root.CFrame
+    bodyGyro.MaxTorque = Vector3.new(CFG.HoldForce, CFG.HoldForce, CFG.HoldForce)
+    bodyGyro.P = 10000
+    bodyGyro.D = 1000
+    bodyGyro.Parent = root
+
+    return true
+end
+
+--// SMOOTH TWEEN MOVEMENT
+local function glideTo(block)
+    if not enabled or not block or not block.Parent then return false end
+
+    local _, humanoid, root = getChar()
+    if not root or not humanoid then return false end
+    if not startHover() then return false end
+
+    local target = blockPosition(block)
+    if not target then return false end
+
+    local offset = root.Position - target
+    local direction = Vector3.new(offset.X, 0, offset.Z)
+
+    if direction.Magnitude < 0.1 then
+        direction = Vector3.new(1, 0, 0)
+    else
+        direction = direction.Unit
+    end
+
+    local destination = target + direction * CFG.MoveRange + Vector3.new(0, CFG.HoverHeight, 0)
+    local distance = (bodyPosition.Position - destination).Magnitude
+    local duration = math.max(distance / CFG.GlideSpeed, 0.5)
+
+    if currentTween then currentTween:Cancel(); currentTween = nil end
+
+    currentTween = TweenService:Create(
+        bodyPosition,
+        TweenInfo.new(duration, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
+        { Position = destination }
+    )
+
+    currentTween:Play()
+    local result = currentTween.Completed:Wait()
+    currentTween = nil
+    return enabled and result == Enum.PlaybackState.Completed
+end
+
+--// BREAK BLOCKS WHILE HOVERING
+local function breakNearby(blocks)
+    while enabled do
+        if not startHover() then return end
+
+        local _, _, root = getChar()
+        if not root then return end
+
+        local found = false
+
+        for _, block in ipairs(blocks:GetChildren()) do
+            if not enabled then return end
+
+            if validBlock(block) then
+                local pos = blockPosition(block)
+                if pos and (root.Position - pos).Magnitude <= CFG.BreakRange then
+                    found = true
+                    pcall(function()
+                        SwingRemote:FireServer(block)
+                    end)
+                    task.wait(CFG.BreakSpeed)
+                end
+            end
+        end
+
+        if not found then break end
+        task.wait(0.1)
+    end
+end
+
+--// CLEANUP
 local function stopHover()
-	if hoverConn then hoverConn:Disconnect(); hoverConn = nil end
-	hoverCF = nil
-	local hum = getChar()
-	if hum then
-		hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
-		hum:Move(Vector3.zero, false)
-	end
+    if currentTween then currentTween:Cancel(); currentTween = nil end
+    if bodyPosition then bodyPosition:Destroy(); bodyPosition = nil end
+    if bodyGyro then bodyGyro:Destroy(); bodyGyro = nil end
+
+    if activeHumanoid and activeHumanoid.Parent then
+        activeHumanoid.AutoRotate = true
+        activeHumanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+    end
+
+    activeRoot = nil
+    activeHumanoid = nil
 end
 
-local function glideActive(goal, active)
-	local hum, root = getChar()
-	if not hum then return false end
-	startHover(hum, root)
-	while active() do
-		if hum.Health <= 0 then return false end
-		local d = goal - hoverCF.Position
-		if d.Magnitude <= 0.75 then break end
-		local dt = RunService.Heartbeat:Wait()
-		hoverCF = hoverCF + d.Unit * math.min(CFG.GlideSpeed * dt, d.Magnitude)
-		local flat = Vector3.new(d.X, 0, d.Z)
-		hum:Move(flat.Magnitude > 1 and flat.Unit or Vector3.zero, false)
-	end
-	hum:Move(Vector3.zero, false)
-	return true
+--// MAIN LOOP
+local function start()
+    if running then return end
+    running = true
+
+    task.spawn(function()
+        while enabled do
+            local _, _, root = getChar()
+            local blocks = getBlocks()
+
+            if root and blocks then
+                startHover()
+                local target = nearestBlock(blocks, root)
+
+                if target then
+                    local pos = blockPosition(target)
+                    if pos then
+                        local distance = (root.Position - pos).Magnitude
+                        if distance > CFG.BreakRange then
+                            glideTo(target)
+                        end
+                        if enabled then
+                            breakNearby(blocks)
+                        end
+                    end
+                else
+                    task.wait(0.5)
+                end
+            else
+                task.wait(1)
+            end
+            task.wait(0.05)
+        end
+        stopHover()
+        running = false
+    end)
 end
 
-local function glideAbove(pos, offset, run)
-	return glideActive(pos + Vector3.new(0, offset, 0), function()
-		return Enabled and run == RunId
-	end)
-end
+--// UI
+local Window = Rayfield:CreateWindow({
+    name = "VANTA | CLEAN STONE",
+    loadingTitle = "VANTA",
+    loadingSubtitle = "by dj",
+})
 
--- ===== the snake builder =====
-local function build(seedKey, run)
-	local Remote = RS:WaitForChild("Remotes"):WaitForChild("RequestPlace")
-	local sx, sy, sz = seedKey:match(KEY_PATTERN)
-	sx, sy, sz = tonumber(sx), tonumber(sy), tonumber(sz)
-	if not sx then return end
+local Tab = Window:CreateTab({
+    name = "Cleanup",
+})
 
-	local blueprint = terrainBlueprint(sx, sy, sz)
-	
-	local pending, total, counts = {}, 0, {}
-	for key, c in pairs(blueprint) do
-		if not occupied[key] then
-			pending[key] = c
-			total += 1
-			counts[c[4]] = (counts[c[4]] or 0) + 1
-		end
-	end
+Tab:CreateToggle({
+    name = "Auto Break Stone Walls",
+    flag = "AutoBreakStone",
+    currentValue = false,
+    callback = function(value)
+        enabled = value
+        if value then
+            start()
+        else
+            stopHover()
+        end
+    end,
+})
 
-	local materials = {}
-	for id, n in pairs(counts) do
-		materials[#materials + 1] = ("%dx %s"):format(n, id)
-	end
-	table.sort(materials)
-	notify("Building the Shell", ("%d blocks: %s"):format(total, table.concat(materials, ", ")))
-
-	local frontierByY = {}
-	local function addFrontier(key, c)
-		local set = frontierByY[c[2]]
-		if not set then set = {}; frontierByY[c[2]] = set end
-		set[key] = c
-	end
-
-	for key, c in pairs(pending) do
-		for _, d in ipairs(DIRS) do
-			if occupied[fmt(c[1] + d[1], c[2] + d[2], c[3] + d[3])] then
-				addFrontier(key, c)
-				break
-			end
-		end
-	end
-
-	local function finish(key)
-		local c = pending[key]
-		if not c then return nil end
-		pending[key] = nil
-		local set = frontierByY[c[2]]
-		if set then set[key] = nil end
-		return c
-	end
-
-	local function confirm(key)
-		if not finish(key) then return end
-		local x, y, z = key:match(KEY_PATTERN)
-		x, y, z = tonumber(x), tonumber(y), tonumber(z)
-		for _, d in ipairs(DIRS) do
-			local nk = fmt(x + d[1], y + d[2], z + d[3])
-			local nc = pending[nk]
-			if nc then addFrontier(nk, nc) end
-		end
-	end
-
-	local function supporters(c, preferKey)
-		local list = {}
-		for _, d in ipairs(DIRS) do
-			local sk = fmt(c[1] + d[1], c[2] + d[2], c[3] + d[3])
-			local sb = occupied[sk]
-			if sb and sb.Parent then
-				local entry = { key = sk, normal = Vector3.new(-d[1], -d[2], -d[3]) }
-				if sk == preferKey then table.insert(list, 1, entry) else list[#list + 1] = entry end
-			end
-		end
-		return list
-	end
-
-	local cx, cy, cz = sx, sy, sz
-	local lastDx, lastDz = 0, 0
-	local curKey = seedKey
-
-	local function pickNext()
-		local activeY
-		for y, set in pairs(frontierByY) do
-			if next(set) ~= nil and (not activeY or y > activeY) then activeY = y end
-		end
-		if not activeY then return nil end
-		local set = frontierByY[activeY]
-
-		local bestKey, bestScore
-		if cy == activeY then
-			for _, d in ipairs(HORIZONTAL) do
-				local nk = fmt(cx + d[1], activeY, cz + d[2])
-				if set[nk] then
-					local open = 0
-					for _, e in ipairs(HORIZONTAL) do
-						if pending[fmt(cx + d[1] + e[1], activeY, cz + d[2] + e[2])] then open += 1 end
-					end
-					local score = open - ((d[1] == lastDx and d[2] == lastDz) and 0.5 or 0)
-					if not bestScore or score < bestScore then bestKey, bestScore = nk, score end
-				end
-			end
-		elseif cy - 1 == activeY and set[fmt(cx, activeY, cz)] then
-			bestKey = fmt(cx, activeY, cz)
-		end
-		if bestKey then return bestKey, set[bestKey] end
-
-		local nearestKey, nearestD
-		for key, c in pairs(set) do
-			local dx, dy, dz = c[1] - cx, c[2] - cy, c[3] - cz
-			local dist = dx * dx + dy * dy + dz * dz
-			if not nearestD or dist < nearestD then nearestKey, nearestD = key, dist end
-		end
-		return nearestKey, set[nearestKey]
-	end
-
-	local delay = CFG.PlaceDelay
-	local function placeOne(key, c)
-		local sups = supporters(c, curKey)
-		if #sups == 0 then return false end
-		for attempt = 1, CFG.MaxRetries + 1 do
-			if not Enabled or run ~= RunId then return false end
-			local sup = sups[((attempt - 1) % #sups) + 1]
-			local sb = occupied[sup.key]
-			if sb and sb.Parent then
-				if not glideAbove(blockPos(sb), attempt == 1 and CFG.HoverHeight or 2, run) then return false end
-			end
-			local normal = (attempt == 2) and FIXED_NORMAL or sup.normal
-			Remote:FireServer({ x = c[1], y = c[2], z = c[3] }, c[4], 0, normal, false, nil, false)
-
-			local deadline = os.clock() + CFG.CheckTimeout
-			while not occupied[key] and os.clock() < deadline and Enabled and run == RunId do task.wait(0.03) end
-			if occupied[key] then return true end
-			delay = math.min(math.max(delay * 1.6, 0.15), CFG.MaxDelay)
-		end
-		return false
-	end
-
-	local placed, failed = 0, 0
-	while Enabled and run == RunId do
-		local key, c = pickNext()
-		if not key then break end
-		local ok = placeOne(key, c)
-		if not Enabled or run ~= RunId then return end
-
-		if ok then
-			placed += 1
-			if c[2] == cy then lastDx, lastDz = c[1] - cx, c[3] - cz end
-			confirm(key)
-			cx, cy, cz, curKey = c[1], c[2], c[3], key
-			local b = occupied[key]
-			if b and b.Parent then glideAbove(blockPos(b), CFG.HoverHeight, run) end
-			delay = math.max(CFG.PlaceDelay, delay * 0.95)
-		else
-			failed += 1
-			finish(key)
-		end
-		task.wait(delay)
-	end
-end
-
-local function runBuild(seedKey, run)
-	building = true
-	buildStart, buildEnd = os.clock(), math.huge
-	local ok, err = pcall(build, seedKey, run)
-	buildEnd = os.clock()
-	building = false
-	stopHover()
-end
-
-local function onBlockAdded(block, run)
-	register(block)
-	local added = os.clock()
-	task.delay(0.15, function()
-		if not Enabled or run ~= RunId then return end
-		if building or (added >= buildStart and added <= buildEnd) then return end
-		local key = block:GetAttribute("CellKey")
-		if not key or not key:match(KEY_PATTERN) then return end
-		task.spawn(runBuild, key, run)
-	end)
-end
-
-local function disconnectAll()
-	for _, c in ipairs(conns) do c:Disconnect() end
-	conns = {}
-end
-
--- ===== auto break grass =====
-local breakingOn = false
-local breakRun = 0
-
-local function startBreaking()
-	breakRun += 1
-	local run = breakRun
-	local function active() return breakingOn and run == breakRun end
-
-	task.spawn(function()
-		local blocks = findBlocksFolder()
-		if not blocks then return end
-		local Swing = RS:WaitForChild("Remotes"):WaitForChild("RequestSwing")
-		local params = OverlapParams.new()
-		params.FilterType = Enum.RaycastFilterType.Include
-		params.FilterDescendantsInstances = { blocks }
-
-		local function grassNear(pos)
-			local list = {}
-			for _, part in ipairs(workspace:GetPartBoundsInRadius(pos, CFG.BreakRange, params)) do
-				if part.Parent == blocks and part:GetAttribute("BlockId") == "GrassBlock" then
-					list[#list + 1] = { part = part, dist = (part.Position - pos).Magnitude }
-				end
-			end
-			table.sort(list, function(a, b) return a.dist < b.dist end)
-			return list
-		end
-
-		local function nearestGrass(pos)
-			local best, bestDist
-			for _, b in ipairs(blocks:GetChildren()) do
-				if b:IsA("BasePart") and b:GetAttribute("BlockId") == "GrassBlock" then
-					local d = (b.Position - pos).Magnitude
-					if not bestDist or d < bestDist then best, bestDist = b, d end
-				end
-			end
-			return best
-		end
-
-		while active() do
-			if building then task.wait(0.5) else
-				local hum, root = getChar()
-				if not hum then task.wait(0.5) else
-					local origin = hoverCF and hoverCF.Position or root.Position
-					local list = grassNear(origin)
-					if #list > 0 then
-						startHover(hum, root)
-						for i = 1, math.min(#list, 40) do
-							if not active() then break end
-							local part = list[i].part
-							if part.Parent == blocks then
-								Swing:FireServer(part)
-								task.wait(CFG.SwingDelay)
-							end
-						end
-					else
-						local target = nearestGrass(origin)
-						if not target then break end
-						glideActive(target.Position + Vector3.new(0, CFG.HoverHeight + 2, 0), active)
-					end
-				end
-			end
-			task.wait()
-		end
-		if not building then stopHover() end
-	end)
-end
-
--- ===== UI =====
-Tab:CreateToggle(dual({
-	name = "Auto Builder",
-	flag = "AutoBuilder",
-	currentValue = false,
-	callback = function(on)
-		Enabled = on
-		RunId += 1
-		disconnectAll()
-		if not on then return end
-
-		BlocksFolder = findBlocksFolder()
-		if not BlocksFolder then return end
-
-		occupied, blockKey = {}, {}
-		for _, block in ipairs(BlocksFolder:GetChildren()) do register(block) end
-
-		local run = RunId
-		table.insert(conns, BlocksFolder.ChildAdded:Connect(function(block) onBlockAdded(block, run) end))
-		table.insert(conns, BlocksFolder.ChildRemoved:Connect(unregister))
-		notify("Cliff Builder on", "Place a GrassBlock in the center.")
-	end,
-}))
-
-Tab:CreateToggle(dual({
-	name = "Auto Break Grass",
-	flag = "AutoBreakGrass",
-	currentValue = false,
-	callback = function(on)
-		breakingOn = on
-		if on then startBreaking() else breakRun += 1 end
-	end,
-}))
-
-pcall(function()
-	Tab:CreateSlider(dual({
-		name = "Break Speed",
-		flag = "BreakSpeed",
-		range = { 0.05, 1 },
-		increment = 0.05,
-		suffix = " s",
-		currentValue = CFG.SwingDelay,
-		callback = function(v) CFG.SwingDelay = v end,
-	}))
-	
-	Tab:CreateSlider(dual({
-		name = "Place Delay",
-		flag = "BuilderDelay",
-		range = { 0.03, 1 },
-		increment = 0.01,
-		suffix = " s",
-		currentValue = CFG.PlaceDelay,
-		callback = function(v) CFG.PlaceDelay = v end,
-	}))
-end)
-
-notify("VANTA Cliff Builder", "Loaded. Hollow Fortress.")
+Tab:CreateSlider({
+    name = "Break Speed",
+    flag = "BreakSpeed",
+    range = {0.05, 1},
+    increment = 0.05,
+    suffix = " s",
+    currentValue = CFG.BreakSpeed,
+    callback = function(value)
+        CFG.BreakSpeed = value
+    end,
+})
