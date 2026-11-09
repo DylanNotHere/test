@@ -1,4 +1,12 @@
--- autobuilder_v8.0.0 (Flat 120x120 Circle)
+-- berryplanter_v1.0.0
+-- 1. Hold your Berry Bush Seed and turn Auto Plant on.
+-- 2. Plant ONE berry bush by hand on a grass block of your platform.
+--    The script watches what your game sends when you do that (the remote and its arguments) and learns it.
+-- 3. It then plants every other spot the same way: gliding along the platform in a snake path (berry farm
+--    speed), hovering just above each block, sending the learned call for that block, and checking that a
+--    bush really appeared before moving on.
+-- Spacing 1 plants every block; 2 plants every second block in both directions, and so on.
+
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -6,6 +14,7 @@ local player = Players.LocalPlayer
 
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
 
+-- send both lowercase and Capitalised keys so either UI style works
 local function dual(t)
 	local out = {}
 	for k, v in pairs(t) do
@@ -16,30 +25,23 @@ local function dual(t)
 end
 
 local Window = Rayfield:CreateWindow(dual({
-	name = "VANTA | Circle Builder",
+	name = "VANTA | Berry Planter",
 	loadingTitle = "VANTA",
-	loadingSubtitle = "120x120 Flat Platform",
+	loadingSubtitle = "Plant berries",
 }))
-local Tab = Window:CreateTab(dual({ name = "Builder" }))
+local Tab = Window:CreateTab(dual({ name = "Planter" }))
 
 local CFG = {
-	PlaceDelay = 0.1,
-	MaxDelay = 1.0,
-	CheckTimeout = 3,
-	MaxRetries = 4,
-	GlideSpeed = 30,
-	HoverHeight = 4,
-	TerrainRadius = 60, -- 60 = 120x120 diameter
+	Spacing = 1,        -- 1 = every block, 2 = every second block, ...
+	PlantDelay = 0.15,  -- pause after each plant (seconds); it slows itself down if plants aren't confirmed
+	MaxDelay = 1.5,
+	ConfirmTimeout = 2, -- seconds to wait for a bush to appear after planting
+	MaxMisses = 4,      -- stop after this many unconfirmed plants in a row
+	GlideSpeed = 30,    -- studs per second (same as the berry farm)
+	HoverHeight = 4,    -- studs above the block you hover while planting
 }
 
-local FIXED_NORMAL = Vector3.new(-1, 0, 0)
 local KEY_PATTERN = "^(-?%d+),(-?%d+),(-?%d+)$"
-local DIRS = {
-	{ 1, 0, 0 }, { -1, 0, 0 },
-	{ 0, 1, 0 }, { 0, -1, 0 },
-	{ 0, 0, 1 }, { 0, 0, -1 },
-}
-local HORIZONTAL = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }
 
 local function fmt(x, y, z)
 	return string.format("%d,%d,%d", x, y, z)
@@ -47,53 +49,49 @@ end
 
 local function notify(title, content)
 	pcall(function()
-		Rayfield:Notify(dual({ title = title, content = content, duration = 4 }))
+		Rayfield:Notify(dual({ title = title, content = content, duration = 5 }))
 	end)
 end
 
--- ==================================================
--- PROCEDURAL GENERATOR (Flat 120x120 Circle)
--- ==================================================
-local function terrainBlueprint(sx, sy, sz)
-	local cells = {}
-	local radius = CFG.TerrainRadius
-
-	for x = -radius, radius do
-		for z = -radius, radius do
-			local dist = math.sqrt(x*x + z*z)
-			
-			if dist <= radius then
-				local wx = sx + x
-				local wz = sz + z
-				
-				-- Single layer of grass
-				cells[fmt(wx, sy, wz)] = {wx, sy, wz, "GrassBlock"}
-			end
+-- readable version of a value, for the console
+local function show(v, depth)
+	depth = depth or 0
+	local t = typeof(v)
+	if t == "string" then return ("%q"):format(v) end
+	if t == "Instance" then return v:GetFullName() end
+	if t == "table" then
+		if depth >= 2 then return "{...}" end
+		local parts = {}
+		for k, val in pairs(v) do
+			parts[#parts + 1] = tostring(k) .. "=" .. show(val, depth + 1)
+			if #parts >= 8 then break end
 		end
+		return "{" .. table.concat(parts, ", ") .. "}"
 	end
-	return cells
+	return tostring(v)
+end
+
+local function showCall(call)
+	local parts = {}
+	for i = 1, call.args.n do parts[i] = show(call.args[i]) end
+	return call.remote.Name .. "(" .. table.concat(parts, ", ") .. ")"
 end
 
 -- ===== state =====
 local Enabled = false
 local RunId = 0
-local building = false
-local buildStart, buildEnd = math.huge, 0
 
-local BlocksFolder
-local occupied = {}
-local blockKey = {}
+local BlocksFolder, NodesFolder
+local occupied = {}  -- ["x,y,z"] = block
+local blockKey = {}  -- [block] = "x,y,z"
 local conns = {}
 
-local function findBlocksFolder()
+local function findIsland()
 	local fallback
-	for _, island in ipairs(workspace:GetChildren()) do
-		if island.Name:match("^Island_") then
-			local blocks = island:FindFirstChild("Blocks")
-			if blocks then
-				if island.Name:find(tostring(player.UserId), 1, true) then return blocks end
-				fallback = fallback or blocks
-			end
+	for _, c in ipairs(workspace:GetChildren()) do
+		if c.Name:match("^Island_") and c:FindFirstChild("Blocks") then
+			if c.Name:find(tostring(player.UserId), 1, true) then return c end
+			fallback = fallback or c
 		end
 	end
 	return fallback
@@ -115,7 +113,9 @@ local function register(block)
 			conn:Disconnect()
 		end
 	end)
-	task.delay(3, function() if conn.Connected then conn:Disconnect() end end)
+	task.delay(3, function()
+		if conn.Connected then conn:Disconnect() end
+	end)
 end
 
 local function unregister(block)
@@ -131,22 +131,226 @@ local function blockPos(b)
 	return b:GetPivot().Position
 end
 
+local function parseKey(key)
+	local x, y, z = key:match(KEY_PATTERN)
+	return tonumber(x), tonumber(y), tonumber(z)
+end
+
+-- ===== your seeds =====
+local seedKey, seedCount
+do
+	local inv = RS:WaitForChild("Remotes"):FindFirstChild("InventoryChanged")
+	if inv then
+		inv.OnClientEvent:Connect(function(items)
+			if type(items) ~= "table" then return end
+			if not seedKey then
+				for name in pairs(items) do
+					if type(name) == "string" then
+						local n = name:lower()
+						if n:find("berry", 1, true) and n:find("seed", 1, true) then
+							seedKey = name
+							break
+						end
+					end
+				end
+			end
+			if seedKey then
+				seedCount = items[seedKey] or 0
+			end
+		end)
+	end
+end
+
+-- ===== watching what your game sends =====
+local hookOk = type(hookmetamethod) == "function" and type(getnamecallmethod) == "function"
+local hookInstalled = false
+local watching = false
+local recent = {} -- recent outgoing remote calls
+local IGNORE = { RequestSwing = true, RequestEquipSlot = true }
+
+local function installHook()
+	if hookInstalled then return true end
+	if not hookOk then return false end
+	hookInstalled = true
+	local old
+	local wrap = newcclosure or function(f) return f end
+	old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+		if watching and getnamecallmethod() == "FireServer" and typeof(self) == "Instance"
+			and self.ClassName == "RemoteEvent" and not IGNORE[self.Name] then
+			recent[#recent + 1] = { remote = self, args = table.pack(...), t = os.clock() }
+			if #recent > 30 then table.remove(recent, 1) end
+		end
+		return old(self, ...)
+	end))
+	return true
+end
+
+-- ===== learning the planting call =====
+local learned -- { remote, args (packed), ref = the block it was planted on }
+
+-- which grass block does a call argument point at?
+local function resolveBlock(v)
+	local t = typeof(v)
+	if t == "Instance" then
+		if v.Parent == BlocksFolder then return v end
+	elseif t == "table" then
+		if type(v.x) == "number" and type(v.y) == "number" and type(v.z) == "number" then
+			return occupied[fmt(v.x, v.y, v.z)] or occupied[fmt(v.x, v.y - 1, v.z)]
+		end
+	elseif t == "string" then
+		local x, y, z = parseKey(v)
+		if x then return occupied[fmt(x, y, z)] or occupied[fmt(x, y - 1, z)] end
+	elseif t == "Vector3" or t == "CFrame" then
+		local p = t == "CFrame" and v.Position or v
+		if t == "Vector3" and v.Magnitude < 1.5 then return nil end -- a direction, not a position
+		local best, bestD
+		for _, b in pairs(occupied) do
+			if b.Parent then
+				local d = (blockPos(b) - p).Magnitude
+				if not bestD or d < bestD then best, bestD = b, d end
+			end
+		end
+		if best and bestD < 8 then return best end
+	end
+end
+
+local function identifyRef(args)
+	for i = 1, args.n do
+		local b = resolveBlock(args[i])
+		if b then return b end
+	end
+end
+
+-- called when something shows that planting just happened (a bush appeared, or a seed was used)
+local function tryLearn(reason)
+	if learned or not watching then return end
+	local now = os.clock()
+	for i = #recent, 1, -1 do
+		local c = recent[i]
+		if now - c.t <= 2.5 then
+			local ref = identifyRef(c.args)
+			if ref then
+				learned = { remote = c.remote, args = c.args, ref = ref }
+				watching = false
+				print(("[Planter] learned (%s): %s"):format(reason, showCall(learned)))
+				print("[Planter] planted on block " .. tostring(blockKey[ref]))
+				notify("Learned the planting call", learned.remote.Name .. ". Planting the rest now.")
+				return true
+			end
+		end
+	end
+end
+
+-- same call, aimed at another block
+local function retarget(call, target)
+	local ref = call.ref
+	local rx, ry, rz = parseKey(blockKey[ref])
+	local tx, ty, tz = parseKey(blockKey[target])
+	local dx, dz = tx - rx, tz - rz
+	local worldDelta = blockPos(target) - blockPos(ref)
+
+	local out = {}
+	for i = 1, call.args.n do
+		local v = call.args[i]
+		local t = typeof(v)
+		if t == "Instance" then
+			if v == ref then
+				out[i] = target
+			elseif v.Parent == BlocksFolder and blockKey[v] then
+				local x, y, z = parseKey(blockKey[v])
+				local nb = occupied[fmt(x + dx, y, z + dz)]
+				if not nb then return nil end
+				out[i] = nb
+			else
+				out[i] = v
+			end
+		elseif t == "table" and type(v.x) == "number" and type(v.y) == "number" and type(v.z) == "number" then
+			local copy = {}
+			for k, val in pairs(v) do copy[k] = val end
+			copy.x, copy.z = v.x + dx, v.z + dz
+			out[i] = copy
+		elseif t == "string" and v:match(KEY_PATTERN) then
+			local x, y, z = parseKey(v)
+			out[i] = fmt(x + dx, y, z + dz)
+		elseif t == "Vector3" and v.Magnitude > 1.5 then
+			out[i] = v + worldDelta
+		elseif t == "CFrame" then
+			out[i] = v + worldDelta
+		else
+			out[i] = v
+		end
+	end
+	return out
+end
+
+-- ===== bushes that already exist / just appeared (matched to blocks by position) =====
+local bushes = {}         -- ["i,j"] = true, in lattice coordinates around the learned block
+local lattice = nil       -- { origin, vx, vz }
+
+local function buildLattice(ref)
+	local rx, ry, rz = parseKey(blockKey[ref])
+	local origin = blockPos(ref)
+	local vx, vz
+	for _, s in ipairs({ 1, -1 }) do
+		local nb = occupied[fmt(rx + s, ry, rz)]
+		if nb then vx = (blockPos(nb) - origin) * s break end
+	end
+	for _, s in ipairs({ 1, -1 }) do
+		local nb = occupied[fmt(rx, ry, rz + s)]
+		if nb then vz = (blockPos(nb) - origin) * s break end
+	end
+	if vx and vz then
+		lattice = { origin = origin, vx = vx, vz = vz }
+	else
+		lattice = nil
+	end
+end
+
+local function latticeOf(pos)
+	if not lattice then return nil end
+	local d = pos - lattice.origin
+	local i = math.floor(d:Dot(lattice.vx) / lattice.vx:Dot(lattice.vx) + 0.5)
+	local j = math.floor(d:Dot(lattice.vz) / lattice.vz:Dot(lattice.vz) + 0.5)
+	return i, j
+end
+
+local function isBush(inst)
+	return inst.Name:lower():find("berry", 1, true) ~= nil
+end
+
+local function markBush(inst)
+	if not lattice then return end
+	local ok, pos = pcall(function()
+		local hb = inst:FindFirstChild("HB")
+		if hb and hb:IsA("BasePart") then return hb.Position end
+		return inst:GetPivot().Position
+	end)
+	if ok and pos then
+		local i, j = latticeOf(pos)
+		if i then bushes[i .. "," .. j] = true end
+	end
+end
+
+-- ===== moving: glide + hover =====
 local function getChar()
 	local char = player.Character
 	if not char then return end
 	local hum = char:FindFirstChildOfClass("Humanoid")
 	local root = char:FindFirstChild("HumanoidRootPart")
-	if hum and root and hum.Health > 0 then return hum, root end
+	if hum and root and hum.Health > 0 then
+		return hum, root
+	end
 end
 
 local hoverCF, hoverConn
+
 local function startHover(hum, root)
 	if hoverConn then return end
 	hoverCF = root.CFrame
-	hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
+	hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false) -- no falling pose while hovering
 	hoverConn = RunService.Heartbeat:Connect(function()
 		if root.Parent then
-			root.CFrame = hoverCF
+			root.CFrame = hoverCF -- hold position so you don't drop between moves
 			root.AssemblyLinearVelocity = Vector3.zero
 			if hum:GetState() == Enum.HumanoidStateType.Freefall then
 				hum:ChangeState(Enum.HumanoidStateType.Running)
@@ -156,7 +360,10 @@ local function startHover(hum, root)
 end
 
 local function stopHover()
-	if hoverConn then hoverConn:Disconnect(); hoverConn = nil end
+	if hoverConn then
+		hoverConn:Disconnect()
+		hoverConn = nil
+	end
 	hoverCF = nil
 	local hum = getChar()
 	if hum then
@@ -165,241 +372,273 @@ local function stopHover()
 	end
 end
 
-local function glideActive(goal, active)
+local function glideAbove(pos, offset, run)
 	local hum, root = getChar()
 	if not hum then return false end
 	startHover(hum, root)
-	while active() do
+
+	local goal = pos + Vector3.new(0, offset, 0)
+	while Enabled and run == RunId do
 		if hum.Health <= 0 then return false end
 		local d = goal - hoverCF.Position
 		if d.Magnitude <= 0.75 then break end
+
 		local dt = RunService.Heartbeat:Wait()
 		hoverCF = hoverCF + d.Unit * math.min(CFG.GlideSpeed * dt, d.Magnitude)
-		local flat = Vector3.new(d.X, 0, d.Z)
+
+		local flat = Vector3.new(d.X, 0, d.Z) -- plays the walking animation while gliding
 		hum:Move(flat.Magnitude > 1 and flat.Unit or Vector3.zero, false)
 	end
+
 	hum:Move(Vector3.zero, false)
 	return true
 end
 
-local function glideAbove(pos, offset, run)
-	return glideActive(pos + Vector3.new(0, offset, 0), function()
-		return Enabled and run == RunId
-	end)
-end
+-- ===== planting =====
+local planting = false
 
--- ===== the snake builder =====
-local function build(seedKey, run)
-	local Remote = RS:WaitForChild("Remotes"):WaitForChild("RequestPlace")
-	local sx, sy, sz = seedKey:match(KEY_PATTERN)
-	sx, sy, sz = tonumber(sx), tonumber(sy), tonumber(sz)
-	if not sx then return end
+-- every grass block on the platform's layer, as a snake path
+local function buildTargets()
+	local ref = learned.ref
+	local rx, ry, rz = parseKey(blockKey[ref])
+	local refId = ref:GetAttribute("BlockId")
+	local S = math.max(1, math.floor(CFG.Spacing))
 
-	local blueprint = terrainBlueprint(sx, sy, sz)
-	
-	local pending, total = {}, 0
-	for key, c in pairs(blueprint) do
-		if not occupied[key] then
-			pending[key] = c
-			total += 1
-		end
-	end
-
-	notify("Building the platform", ("%d blocks"):format(total))
-
-	local frontierByY = {}
-	local function addFrontier(key, c)
-		local set = frontierByY[c[2]]
-		if not set then set = {}; frontierByY[c[2]] = set end
-		set[key] = c
-	end
-
-	for key, c in pairs(pending) do
-		for _, d in ipairs(DIRS) do
-			if occupied[fmt(c[1] + d[1], c[2] + d[2], c[3] + d[3])] then
-				addFrontier(key, c)
-				break
-			end
-		end
-	end
-
-	local function finish(key)
-		local c = pending[key]
-		if not c then return nil end
-		pending[key] = nil
-		local set = frontierByY[c[2]]
-		if set then set[key] = nil end
-		return c
-	end
-
-	local function confirm(key)
-		if not finish(key) then return end
-		local x, y, z = key:match(KEY_PATTERN)
-		x, y, z = tonumber(x), tonumber(y), tonumber(z)
-		for _, d in ipairs(DIRS) do
-			local nk = fmt(x + d[1], y + d[2], z + d[3])
-			local nc = pending[nk]
-			if nc then addFrontier(nk, nc) end
-		end
-	end
-
-	local function supporters(c, preferKey)
-		local list = {}
-		for _, d in ipairs(DIRS) do
-			local sk = fmt(c[1] + d[1], c[2] + d[2], c[3] + d[3])
-			local sb = occupied[sk]
-			if sb and sb.Parent then
-				local entry = { key = sk, normal = Vector3.new(-d[1], -d[2], -d[3]) }
-				if sk == preferKey then table.insert(list, 1, entry) else list[#list + 1] = entry end
-			end
-		end
-		return list
-	end
-
-	local cx, cy, cz = sx, sy, sz
-	local lastDx, lastDz = 0, 0
-	local curKey = seedKey
-
-	local function pickNext()
-		local activeY
-		for y, set in pairs(frontierByY) do
-			if next(set) ~= nil and (not activeY or y > activeY) then activeY = y end
-		end
-		if not activeY then return nil end
-		local set = frontierByY[activeY]
-
-		local bestKey, bestScore
-		if cy == activeY then
-			for _, d in ipairs(HORIZONTAL) do
-				local nk = fmt(cx + d[1], activeY, cz + d[2])
-				if set[nk] then
-					local open = 0
-					for _, e in ipairs(HORIZONTAL) do
-						if pending[fmt(cx + d[1] + e[1], activeY, cz + d[2] + e[2])] then open += 1 end
-					end
-					local score = open - ((d[1] == lastDx and d[2] == lastDz) and 0.5 or 0)
-					if not bestScore or score < bestScore then bestKey, bestScore = nk, score end
+	local rows = {}
+	for key, b in pairs(occupied) do
+		if b.Parent and b:GetAttribute("BlockId") == refId then
+			local x, y, z = parseKey(key)
+			if y == ry then
+				local i, j = x - rx, z - rz
+				if i % S == 0 and j % S == 0 and not bushes[i .. "," .. j] then
+					rows[j] = rows[j] or {}
+					table.insert(rows[j], { i = i, j = j, block = b })
 				end
 			end
-		elseif cy - 1 == activeY and set[fmt(cx, activeY, cz)] then
-			bestKey = fmt(cx, activeY, cz)
 		end
-		if bestKey then return bestKey, set[bestKey] end
-
-		local nearestKey, nearestD
-		for key, c in pairs(set) do
-			local dx, dy, dz = c[1] - cx, c[2] - cy, c[3] - cz
-			local dist = dx * dx + dy * dy + dz * dz
-			if not nearestD or dist < nearestD then nearestKey, nearestD = key, dist end
-		end
-		return nearestKey, set[nearestKey]
 	end
 
-	local delay = CFG.PlaceDelay
-	local function placeOne(key, c)
-		local sups = supporters(c, curKey)
-		if #sups == 0 then return false end
-		for attempt = 1, CFG.MaxRetries + 1 do
-			if not Enabled or run ~= RunId then return false end
-			local sup = sups[((attempt - 1) % #sups) + 1]
-			local sb = occupied[sup.key]
-			if sb and sb.Parent then
-				if not glideAbove(blockPos(sb), attempt == 1 and CFG.HoverHeight or 2, run) then return false end
+	local js = {}
+	for j in pairs(rows) do js[#js + 1] = j end
+	table.sort(js)
+
+	local targets = {}
+	for n, j in ipairs(js) do
+		local row = rows[j]
+		table.sort(row, function(a, b)
+			if n % 2 == 1 then return a.i < b.i end
+			return a.i > b.i
+		end)
+		for _, t in ipairs(row) do targets[#targets + 1] = t end
+	end
+	return targets
+end
+
+local function plantAll(run)
+	planting = true
+	buildLattice(learned.ref)
+	if NodesFolder then
+		for _, n in ipairs(NodesFolder:GetChildren()) do
+			if isBush(n) then markBush(n) end
+		end
+	end
+	markBush(learned.ref) -- the one planted by hand sits on this block (its bush may not be in Nodes yet)
+	do
+		local i, j = 0, 0
+		bushes[i .. "," .. j] = true
+	end
+
+	local targets = buildTargets()
+	print(("[Planter] %d spots to plant (spacing %d)"):format(#targets, CFG.Spacing))
+	notify("Planting", ("%d spots"):format(#targets))
+
+	local delay = CFG.PlantDelay
+	local planted, misses = 0, 0
+
+	for _, t in ipairs(targets) do
+		if not Enabled or run ~= RunId then break end
+		if seedCount and seedCount <= 0 then
+			notify("Out of seeds", ("Planted %d. Get more Berry Bush Seeds and turn it on again."):format(planted))
+			break
+		end
+		local key = t.i .. "," .. t.j
+		if t.block.Parent and not bushes[key] then
+			if not glideAbove(blockPos(t.block), CFG.HoverHeight, run) then break end
+
+			local args = retarget(learned, t.block)
+			if args then
+				local before = seedCount
+				learned.remote:FireServer(table.unpack(args, 1, learned.args.n))
+
+				-- confirmed once a bush shows up on that block, or your seed count drops
+				local deadline = os.clock() + CFG.ConfirmTimeout
+				local ok = false
+				while os.clock() < deadline and Enabled and run == RunId do
+					if bushes[key] or (before and seedCount and seedCount < before) then
+						ok = true
+						break
+					end
+					task.wait(0.03)
+				end
+
+				if ok then
+					bushes[key] = true
+					planted += 1
+					misses = 0
+					delay = math.max(CFG.PlantDelay, delay * 0.95)
+					if planted % 200 == 0 then
+						print(("[Planter] %d planted"):format(planted))
+					end
+				else
+					misses += 1
+					delay = math.min(delay * 1.6 + 0.05, CFG.MaxDelay)
+					if misses >= CFG.MaxMisses then
+						warn(("[Planter] %d plants in a row weren't confirmed, stopping. Last call: %s")
+							:format(misses, showCall({ remote = learned.remote, args = table.pack(table.unpack(args, 1, learned.args.n)) })))
+						notify("Stopped", "Plants aren't being confirmed. Check the console, or press Relearn and plant one by hand.")
+						break
+					end
+				end
 			end
-			local normal = (attempt == 2) and FIXED_NORMAL or sup.normal
-			Remote:FireServer({ x = c[1], y = c[2], z = c[3] }, c[4], 0, normal, false, nil, false)
-
-			local deadline = os.clock() + CFG.CheckTimeout
-			while not occupied[key] and os.clock() < deadline and Enabled and run == RunId do task.wait(0.03) end
-			if occupied[key] then return true end
-			delay = math.min(math.max(delay * 1.6, 0.15), CFG.MaxDelay)
+			task.wait(delay)
 		end
-		return false
 	end
 
-	local placed, failed = 0, 0
-	while Enabled and run == RunId do
-		local key, c = pickNext()
-		if not key then break end
-		local ok = placeOne(key, c)
-		if not Enabled or run ~= RunId then return end
-
-		if ok then
-			placed += 1
-			if c[2] == cy then lastDx, lastDz = c[1] - cx, c[3] - cz end
-			confirm(key)
-			cx, cy, cz, curKey = c[1], c[2], c[3], key
-			local b = occupied[key]
-			if b and b.Parent then glideAbove(blockPos(b), CFG.HoverHeight, run) end
-			delay = math.max(CFG.PlaceDelay, delay * 0.95)
-		else
-			failed += 1
-			finish(key)
-		end
-		task.wait(delay)
-	end
-end
-
-local function runBuild(seedKey, run)
-	building = true
-	buildStart, buildEnd = os.clock(), math.huge
-	local ok, err = pcall(build, seedKey, run)
-	buildEnd = os.clock()
-	building = false
+	print(("[Planter] done: %d planted"):format(planted))
 	stopHover()
+	planting = false
 end
 
-local function onBlockAdded(block, run)
-	register(block)
-	local added = os.clock()
-	task.delay(0.15, function()
-		if not Enabled or run ~= RunId then return end
-		if building or (added >= buildStart and added <= buildEnd) then return end
-		local key = block:GetAttribute("CellKey")
-		if not key or not key:match(KEY_PATTERN) then return end
-		task.spawn(runBuild, key, run)
-	end)
-end
-
+-- ===== arming =====
 local function disconnectAll()
 	for _, c in ipairs(conns) do c:Disconnect() end
 	conns = {}
 end
 
+local function startWhenLearned(run)
+	task.spawn(function()
+		while Enabled and run == RunId and not learned do
+			task.wait(0.25)
+		end
+		if Enabled and run == RunId and learned and not planting then
+			plantAll(run)
+		end
+	end)
+end
+
+local function arm()
+	local island = findIsland()
+	BlocksFolder = island and island:FindFirstChild("Blocks")
+	NodesFolder = island and island:FindFirstChild("Nodes")
+	if not BlocksFolder then
+		warn("[Planter] couldn't find your island's Blocks folder")
+		return false
+	end
+
+	occupied, blockKey, bushes = {}, {}, {}
+	for _, b in ipairs(BlocksFolder:GetChildren()) do register(b) end
+
+	table.insert(conns, BlocksFolder.ChildAdded:Connect(register))
+	table.insert(conns, BlocksFolder.ChildRemoved:Connect(unregister))
+
+	if NodesFolder then
+		table.insert(conns, NodesFolder.ChildAdded:Connect(function(n)
+			task.wait(0.1)
+			if isBush(n) then
+				if learned then
+					markBush(n)
+				else
+					tryLearn("a bush appeared")
+				end
+			end
+		end))
+	end
+
+	-- a dropped seed count also means you just planted something
+	local lastSeeds = seedCount
+	table.insert(conns, RunService.Heartbeat:Connect(function()
+		if not learned and seedCount and lastSeeds and seedCount < lastSeeds then
+			tryLearn("a seed was used")
+		end
+		lastSeeds = seedCount
+	end))
+	return true
+end
+
 -- ===== UI =====
 Tab:CreateToggle(dual({
-	name = "Auto Builder",
-	flag = "AutoBuilder",
+	name = "Auto Plant",
+	flag = "AutoPlant",
 	currentValue = false,
 	callback = function(on)
 		Enabled = on
 		RunId += 1
 		disconnectAll()
-		if not on then return end
 
-		BlocksFolder = findBlocksFolder()
-		if not BlocksFolder then return end
+		if not on then
+			watching = false
+			notify("Auto Plant off", "Stopped.")
+			return
+		end
 
-		occupied, blockKey = {}, {}
-		for _, block in ipairs(BlocksFolder:GetChildren()) do register(block) end
+		if not arm() then return end
 
-		local run = RunId
-		table.insert(conns, BlocksFolder.ChildAdded:Connect(function(block) onBlockAdded(block, run) end))
-		table.insert(conns, BlocksFolder.ChildRemoved:Connect(unregister))
-		notify("Circle Builder on", "Place a GrassBlock in the center.")
+		if learned then
+			notify("Auto Plant on", "Using the planting call it already learned.")
+			startWhenLearned(RunId)
+		else
+			if not installHook() then
+				warn("[Planter] your executor can't watch remote calls (no hookmetamethod).")
+				notify("Can't learn here", "Send me a Cobalt capture of planting one berry bush instead.")
+				return
+			end
+			watching = true
+			notify("Plant ONE berry bush by hand", "Hold the Berry Bush Seed and plant one on a grass block. I'll do the rest.")
+			startWhenLearned(RunId)
+		end
 	end,
 }))
 
 pcall(function()
 	Tab:CreateSlider(dual({
-		name = "Place Delay",
-		flag = "BuilderDelay",
-		range = { 0.03, 1 },
-		increment = 0.01,
-		suffix = " s",
-		currentValue = CFG.PlaceDelay,
-		callback = function(v) CFG.PlaceDelay = v end,
+		name = "Spacing (1 = every block)",
+		flag = "PlantSpacing",
+		range = { 1, 5 },
+		increment = 1,
+		suffix = " blocks",
+		currentValue = CFG.Spacing,
+		callback = function(v) CFG.Spacing = math.floor(v) end,
 	}))
 end)
 
-notify("VANTA Circle Builder", "Loaded. Place a block at the center.")
+pcall(function()
+	Tab:CreateSlider(dual({
+		name = "Plant Delay",
+		flag = "PlantDelay",
+		range = { 0.03, 1 },
+		increment = 0.01,
+		suffix = " s",
+		currentValue = CFG.PlantDelay,
+		callback = function(v) CFG.PlantDelay = v end,
+	}))
+end)
+
+pcall(function()
+	Tab:CreateButton(dual({
+		name = "Relearn (plant one by hand again)",
+		callback = function()
+			learned = nil
+			bushes = {}
+			if Enabled then
+				RunId += 1
+				watching = hookOk and installHook()
+				notify("Relearning", "Plant ONE berry bush by hand.")
+				startWhenLearned(RunId)
+			else
+				notify("Forgot the planting call", "Turn Auto Plant on and plant one by hand.")
+			end
+		end,
+	}))
+end)
+
+notify("VANTA Berry Planter", "Loaded. Hold your seed, turn Auto Plant on, plant one bush by hand.")
