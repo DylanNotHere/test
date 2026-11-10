@@ -1,426 +1,434 @@
-
---==================================================
--- VANTA | MULTI-TARGET BERRY HARVESTER v2.0
--- HEARTBEAT GLIDE + 12-HIT MULTI-BURST + SNAKE SWEEP
---==================================================
-
+-- berryharvest_v1.3.0 (Shape-Aware Snake Sweep)
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
-
 local player = Players.LocalPlayer
-local HarvestRemote = RS:WaitForChild("Remotes"):WaitForChild("RequestHarvest")
 
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
 
-local Window = Rayfield:CreateWindow({
-    name = "VANTA | Berry Harvester",
-    loadingTitle = "VANTA",
-    loadingSubtitle = "Multi-Burst v2.0",
-})
+local function dual(t)
+	local out = {}
+	for k, v in pairs(t) do
+		out[k] = v
+		out[k:sub(1, 1):upper() .. k:sub(2)] = v
+	end
+	return out
+end
 
-local Tab = Window:CreateTab({ name = "Farm" })
+local Window = Rayfield:CreateWindow(dual({
+	name = "VANTA | Berry Harvest",
+	loadingTitle = "VANTA",
+	loadingSubtitle = "Shape-Aware Sweep",
+}))
+local Tab = Window:CreateTab(dual({ name = "Harvest" }))
 
 local CFG = {
-    GlideSpeed = 40,
-    HoverHeight = 3,
-    GlideTimeout = 10,
-
-    HarvestRange = 14,
-    MoveDistance = 6,
-
-    BurstAmount = 12,
-    BurstDelay = 0.05,
-    RefireDelay = 0.1,
-
-    PortalPos = Vector3.new(3044.90649, 209.518799, -17.9989929),
-    AvoidRadius = 20,
+	Range = 10,         -- Harvest radius
+	HarvestRate = 10,   -- Requests per second
+	Burst = 2,          -- Requests per tick
+	GlideSpeed = 10,    -- Glide speed
+	HoverHeight = 7,    -- Hover height
+	StepSize = 12,      -- Distance between snake path points (12 studs = 3 blocks)
+	Retry = 1.5,
+	MaxTries = 3,
+	SkipFor = 30,
+	RegrowTime = 60,
 }
 
-local enabled = false
-local freefallWasEnabled = true
+local function notify(title, content)
+	pcall(function()
+		Rayfield:Notify(dual({ title = title, content = content, duration = 4 }))
+	end)
+end
 
---==================================================
--- CHARACTER
---==================================================
+-- ===== bushes (cached, with a grid so range checks stay cheap) =====
+local bushes = {}   -- [node] = entry
+local grid = {}     -- ["gx,gz"] = { entries }
+local conns = {}
+local cell = CFG.Range
 
+local function cellOf(pos)
+	return math.floor(pos.X / cell), math.floor(pos.Z / cell)
+end
+
+local function findNodes()
+	local fallback
+	for _, c in ipairs(workspace:GetChildren()) do
+		if c.Name:match("^Island_") then
+			local n = c:FindFirstChild("Nodes")
+			if n then
+				if c.Name:find(tostring(player.UserId), 1, true) then return n end
+				fallback = fallback or n
+			end
+		end
+	end
+	return fallback
+end
+
+local function addBush(node)
+	if bushes[node] or not node.Name:find("Berry", 1, true) then return end
+	local hb = node:FindFirstChild("HB") or node:WaitForChild("HB", 3)
+	if not hb or bushes[node] then return end
+	local e = { node = node, hb = hb, berries = node:FindFirstChild("Berries"), nextTry = 0, tries = 0, nextReady = 0 }
+	e.gx, e.gz = cellOf(hb.Position)
+	e.key = e.gx .. "," .. e.gz
+	bushes[node] = e
+	grid[e.key] = grid[e.key] or {}
+	table.insert(grid[e.key], e)
+end
+
+local function removeBush(node)
+	local e = bushes[node]
+	if not e then return end
+	bushes[node] = nil
+	local list = grid[e.key]
+	if list then
+		for i, x in ipairs(list) do
+			if x == e then
+				table.remove(list, i)
+				break
+			end
+		end
+	end
+end
+
+-- ===== is a bush ready? =====
+local visualWorks = true
+
+local function isReady(e)
+	if not visualWorks then
+		return os.clock() >= e.nextReady
+	end
+	local b = e.berries
+	if not b or not b.Parent then
+		b = e.node:FindFirstChild("Berries")
+		e.berries = b
+	end
+	if not b then return true end
+	if b:IsA("BasePart") then
+		return b.Transparency < 0.95
+	end
+	for _, p in ipairs(b:GetChildren()) do
+		if p:IsA("BasePart") and p.Transparency < 0.95 then return true end
+	end
+	return false
+end
+
+-- ===== harvesting =====
+local Harvest = RS:WaitForChild("Remotes"):WaitForChild("RequestHarvest")
+local fired, transitions = 0, 0
+
+local function readyNear(pos, now)
+	local out = {}
+	local gx, gz = cellOf(pos)
+	local r2 = CFG.Range * CFG.Range
+	for dx = -1, 1 do
+		for dz = -1, 1 do
+			local list = grid[(gx + dx) .. "," .. (gz + dz)]
+			if list then
+				for _, e in ipairs(list) do
+					local hb = e.hb
+					if hb.Parent then
+						local d = hb.Position - pos
+						local d2 = d.X * d.X + d.Y * d.Y + d.Z * d.Z
+						if d2 <= r2 then
+							if isReady(e) then
+								if now >= e.nextTry then
+									out[#out + 1] = { e = e, d2 = d2 }
+								end
+							elseif e.tries > 0 then
+								e.tries = 0
+								transitions += 1
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	table.sort(out, function(a, b) return a.d2 < b.d2 end)
+	return out
+end
+
+local function harvestTick(pos, now)
+	local list = readyNear(pos, now)
+	for i = 1, math.min(#list, CFG.Burst) do
+		local e = list[i].e
+		Harvest:FireServer(e.hb)
+		fired += 1
+		e.tries += 1
+		if e.tries >= CFG.MaxTries then
+			e.nextTry = now + CFG.SkipFor
+			e.tries = 0
+		else
+			e.nextTry = now + CFG.Retry
+		end
+		if not visualWorks then
+			e.nextReady = now + CFG.RegrowTime
+		end
+	end
+
+	if visualWorks and fired >= 200 and transitions == 0 then
+		visualWorks = false
+		warn("[Harvest] using timer mode")
+		notify("Timer mode", "Couldn't read the bush state, using a timer per bush.")
+	end
+end
+
+-- ===== moving: glide + hover =====
 local function getChar()
-    local char = player.Character
-    if not char then return end
-
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    local root = char:FindFirstChild("HumanoidRootPart")
-
-    if hum and root and hum.Health > 0 then
-        return hum, root
-    end
+	local char = player.Character
+	if not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if hum and root and hum.Health > 0 then
+		return hum, root
+	end
 end
 
---==================================================
--- PORTAL CHECK
---==================================================
+local hoverCF, hoverConn
 
-local function isNearPortal(pos)
-    local flatPos = Vector3.new(pos.X, 0, pos.Z)
-    local flatPortal = Vector3.new(
-        CFG.PortalPos.X,
-        0,
-        CFG.PortalPos.Z
-    )
-
-    return (flatPos - flatPortal).Magnitude < CFG.AvoidRadius
+local function startHover(hum, root)
+	if hoverConn then return end
+	hoverCF = root.CFrame
+	hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
+	hoverConn = RunService.Heartbeat:Connect(function()
+		if root.Parent then
+			root.CFrame = hoverCF
+			root.AssemblyLinearVelocity = Vector3.zero
+			if hum:GetState() == Enum.HumanoidStateType.Freefall then
+				hum:ChangeState(Enum.HumanoidStateType.Running)
+			end
+		end
+	end)
 end
 
---==================================================
--- ISLAND NODES
---==================================================
-
-local function getNodesFolder()
-    local fallback
-
-    for _, island in ipairs(workspace:GetChildren()) do
-        if island.Name:match("^Island_") then
-            local nodes = island:FindFirstChild("Nodes")
-
-            if nodes then
-                if island.Name:find(tostring(player.UserId), 1, true) then
-                    return nodes
-                end
-
-                fallback = fallback or nodes
-            end
-        end
-    end
-
-    return fallback
+local function stopHover()
+	if hoverConn then
+		hoverConn:Disconnect()
+		hoverConn = nil
+	end
+	hoverCF = nil
+	local hum = getChar()
+	if hum then
+		hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+		hum:Move(Vector3.zero, false)
+	end
 end
 
---==================================================
--- HEARTBEAT GLIDE
--- Uses the movement style from your Slime Farmer
---==================================================
+local Enabled = false
+local RunId = 0
 
-local function glideTo(hum, root, destination)
-    if not enabled or not root.Parent or hum.Health <= 0 then
-        return false
-    end
-
-    local startTime = os.clock()
-    local targetPos = destination + Vector3.new(0, CFG.HoverHeight, 0)
-
-    freefallWasEnabled = true
-    hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
-
-    while enabled
-        and root.Parent
-        and hum.Health > 0
-        and os.clock() - startTime < CFG.GlideTimeout do
-
-        local offset = targetPos - root.Position
-
-        if offset.Magnitude <= 4 then
-            hum:Move(Vector3.zero, false)
-            root.AssemblyLinearVelocity = Vector3.zero
-            return true
-        end
-
-        local dt = RunService.Heartbeat:Wait()
-
-        if not enabled or not root.Parent then
-            break
-        end
-
-        offset = targetPos - root.Position
-
-        if offset.Magnitude > 0.05 then
-            local step = math.min(CFG.GlideSpeed * dt, offset.Magnitude)
-            root.CFrame = root.CFrame + offset.Unit * step
-        end
-
-        root.AssemblyLinearVelocity = Vector3.zero
-
-        local flat = Vector3.new(offset.X, 0, offset.Z)
-        hum:Move(
-            flat.Magnitude > 1 and flat.Unit or Vector3.zero,
-            false
-        )
-
-        if hum:GetState() == Enum.HumanoidStateType.Freefall then
-            hum:ChangeState(Enum.HumanoidStateType.Running)
-        end
-    end
-
-    hum:Move(Vector3.zero, false)
-    return false
+local function active(run)
+	return Enabled and run == RunId
 end
 
-local function restoreMovement()
-    local hum = getChar()
+local function moveTo(goal, run)
+	local hum, root = getChar()
+	if not hum then return false end
+	startHover(hum, root)
 
-    if hum then
-        hum:Move(Vector3.zero, false)
-        hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
-    end
+	local lastTick = 0
+	while active(run) do
+		if hum.Health <= 0 then return false end
+		local d = goal - hoverCF.Position
+		if d.Magnitude <= 1 then break end
+
+		local dt = RunService.Heartbeat:Wait()
+		hoverCF = hoverCF + d.Unit * math.min(CFG.GlideSpeed * dt, d.Magnitude)
+
+		local flat = Vector3.new(d.X, 0, d.Z)
+		hum:Move(flat.Magnitude > 1 and flat.Unit or Vector3.zero, false)
+
+		local now = os.clock()
+		if now - lastTick >= CFG.Burst / CFG.HarvestRate then
+			lastTick = now
+			harvestTick(hoverCF.Position, now)
+		end
+	end
+
+	hum:Move(Vector3.zero, false)
+	return true
 end
 
---==================================================
--- BUILD SNAKE GRID
---==================================================
-
-local function getTargets(nodes)
-    local rows = {}
-
-    for _, node in ipairs(nodes:GetChildren()) do
-        if node.Name == "BerryBush"
-            and node:FindFirstChild("Berries") then
-
-            local hb = node:FindFirstChild("HB")
-
-            if hb and hb:IsA("BasePart") and not isNearPortal(hb.Position) then
-                local z = math.floor(hb.Position.Z / 4) * 4
-
-                rows[z] = rows[z] or {}
-                table.insert(rows[z], hb)
-            end
-        end
-    end
-
-    local zKeys = {}
-
-    for z in pairs(rows) do
-        table.insert(zKeys, z)
-    end
-
-    table.sort(zKeys)
-
-    local targets = {}
-
-    for i, z in ipairs(zKeys) do
-        local row = rows[z]
-
-        table.sort(row, function(a, b)
-            if i % 2 == 1 then
-                return a.Position.X < b.Position.X
-            end
-
-            return a.Position.X > b.Position.X
-        end)
-
-        for _, hb in ipairs(row) do
-            table.insert(targets, hb)
-        end
-    end
-
-    return targets
+-- ===== SHAPE-AWARE SNAKE PATHING =====
+local function planGrid()
+	local sumY, n = 0, 0
+	local rows = {}
+	
+	-- Group actual bushes into Z rows
+	for _, e in pairs(bushes) do
+		if e.hb.Parent then
+			local p = e.hb.Position
+			local z = math.floor(p.Z / CFG.StepSize) * CFG.StepSize
+			
+			rows[z] = rows[z] or {}
+			table.insert(rows[z], p)
+			
+			sumY += p.Y
+			n += 1
+		end
+	end
+	
+	if n == 0 then return nil end
+	local avgY = (sumY / n) + CFG.HoverHeight
+	
+	-- Sort rows by Z
+	local zKeys = {}
+	for z in pairs(rows) do table.insert(zKeys, z) end
+	table.sort(zKeys)
+	
+	local points = {}
+	local forward = true
+	
+	-- Snake through the rows
+	for _, z in ipairs(zKeys) do
+		local row = rows[z]
+		
+		-- Find min and max X for THIS specific row
+		local minX, maxX = math.huge, -math.huge
+		for _, p in ipairs(row) do
+			minX = math.min(minX, p.X)
+			maxX = math.max(maxX, p.X)
+		end
+		
+		-- Step through X
+		if forward then
+			local x = minX
+			while x <= maxX do
+				table.insert(points, Vector3.new(x, avgY, z))
+				x += CFG.StepSize
+			end
+		else
+			local x = maxX
+			while x >= minX do
+				table.insert(points, Vector3.new(x, avgY, z))
+				x -= CFG.StepSize
+			end
+		end
+		
+		forward = not forward
+	end
+	
+	return points, n
 end
 
---==================================================
--- MULTI-TARGET BURST
--- Sends one request to every bush per round
---==================================================
+local function sweepLoop(run)
+	local sweeps = 0
+	while active(run) do
+		local hum = getChar()
+		if not hum then
+			task.wait(1)
+		else
+			local points, n = planGrid()
+			if not points or #points == 0 then
+				warn("[Harvest] no berry bushes found on your island")
+				notify("No bushes found", "Couldn't find any BerryBush in your island's Nodes folder.")
+				break
+			end
 
-local function burstCluster(cluster)
-    local valid = {}
+			local before = fired
+			sweeps += 1
+			for _, point in ipairs(points) do
+				if not active(run) then break end
+				if not moveTo(point, run) then break end
+			end
 
-    for _, hb in ipairs(cluster) do
-        if hb and hb.Parent then
-            table.insert(valid, hb)
-        end
-    end
-
-    for hit = 1, CFG.BurstAmount do
-        if not enabled then
-            break
-        end
-
-        local fired = 0
-
-        for _, hb in ipairs(valid) do
-            if not enabled then
-                break
-            end
-
-            if hb and hb.Parent then
-                HarvestRemote:FireServer(hb)
-                fired += 1
-            end
-        end
-
-        if fired == 0 then
-            break
-        end
-
-        if hit < CFG.BurstAmount then
-            task.wait(CFG.BurstDelay)
-        end
-    end
-
-    task.wait(CFG.RefireDelay)
+			print(("[Harvest] sweep %d done: %d requests (%d bushes)"):format(sweeps, fired - before, n))
+			if fired - before < 5 and active(run) then
+				stopHover()
+				task.wait(10)
+			end
+		end
+		task.wait()
+	end
+	stopHover()
 end
 
---==================================================
--- HARVEST LOOP
---==================================================
+-- ===== arming =====
+local function arm()
+	local nodes = findNodes()
+	if not nodes then
+		warn("[Harvest] couldn't find your island's Nodes folder")
+		return false
+	end
+	for _, c in ipairs(conns) do c:Disconnect() end
+	conns = {}
+	bushes, grid = {}, {}
 
-local function harvestLoop()
-    while enabled do
-        local hum, root = getChar()
-        local nodes = getNodesFolder()
+	for _, n in ipairs(nodes:GetChildren()) do
+		task.spawn(addBush, n)
+	end
+	table.insert(conns, nodes.ChildAdded:Connect(function(n) task.spawn(addBush, n) end))
+	table.insert(conns, nodes.ChildRemoved:Connect(removeBush))
 
-        if hum and root and nodes then
-            local targets = getTargets(nodes)
-            local processed = {}
-            local currentIndex = 1
+	local last = -1
+	for _ = 1, 25 do
+		task.wait(0.15)
+		local c = 0
+		for _ in pairs(bushes) do c += 1 end
+		if c > 0 and c == last then break end
+		last = c
+	end
 
-            while currentIndex <= #targets and enabled do
-                hum, root = getChar()
-
-                if not hum or not root then
-                    break
-                end
-
-                local primaryHB = targets[currentIndex]
-
-                if not primaryHB
-                    or not primaryHB.Parent
-                    or processed[primaryHB]
-                    or isNearPortal(primaryHB.Position) then
-
-                    currentIndex += 1
-                    continue
-                end
-
-                -- Move to the next snake target
-                local arrived = glideTo(hum, root, primaryHB.Position)
-
-                if not enabled then
-                    break
-                end
-
-                if not arrived then
-                    -- Avoid getting stuck on unreachable targets
-                    processed[primaryHB] = true
-                    currentIndex += 1
-                    continue
-                end
-
-                -- Collect every unprocessed bush in range
-                local cluster = {}
-
-                for _, checkHB in ipairs(targets) do
-                    if checkHB
-                        and checkHB.Parent
-                        and not processed[checkHB]
-                        and not isNearPortal(checkHB.Position)
-                        and (checkHB.Position - primaryHB.Position).Magnitude
-                            <= CFG.HarvestRange then
-
-                        table.insert(cluster, checkHB)
-                    end
-                end
-
-                if #cluster > 0 then
-                    -- Mark before firing so targets aren't repeated
-                    for _, hb in ipairs(cluster) do
-                        processed[hb] = true
-                    end
-
-                    burstCluster(cluster)
-                else
-                    processed[primaryHB] = true
-                end
-
-                currentIndex += 1
-            end
-        end
-
-        task.wait(0.5)
-    end
-
-    restoreMovement()
+	local count, ready = 0, 0
+	for _, e in pairs(bushes) do
+		count += 1
+		if isReady(e) then ready += 1 end
+	end
+	print(("[Harvest] %d bushes found, %d ready"):format(count, ready))
+	return count > 0
 end
 
---==================================================
--- UI
---==================================================
+-- ===== UI =====
+Tab:CreateToggle(dual({
+	name = "Auto Harvest",
+	flag = "AutoHarvest",
+	currentValue = false,
+	callback = function(on)
+		Enabled = on
+		RunId += 1
+		if on then
+			if arm() then
+				notify("Auto Harvest on", "Sweeping.")
+				task.spawn(sweepLoop, RunId)
+			else
+				notify("No bushes found", "Couldn't find berry bushes.")
+			end
+		else
+			notify("Auto Harvest off", "Stopped.")
+		end
+	end,
+}))
 
-Tab:CreateToggle({
-    name = "Auto Harvest (Multi-Burst)",
-    flag = "AutoHarvest",
-    currentValue = false,
+pcall(function()
+	Tab:CreateSlider(dual({
+		name = "Harvest Speed",
+		flag = "HarvestRate",
+		range = { 5, 40 },
+		increment = 5,
+		currentValue = CFG.HarvestRate,
+		callback = function(v) CFG.HarvestRate = v end,
+	}))
+	
+	Tab:CreateSlider(dual({
+		name = "Glide Speed",
+		flag = "GlideSpeed",
+		range = { 5, 30 },
+		increment = 1,
+		currentValue = CFG.GlideSpeed,
+		callback = function(v) CFG.GlideSpeed = v end,
+	}))
 
-    callback = function(on)
-        enabled = on
+	Tab:CreateSlider(dual({
+		name = "Grid Size (3x3 = 12 studs)",
+		flag = "StepSize",
+		range = { 6, 24 },
+		increment = 2,
+		suffix = " studs",
+		currentValue = CFG.StepSize,
+		callback = function(v) CFG.StepSize = v end,
+	}))
+end)
 
-        if on then
-            task.spawn(harvestLoop)
-        else
-            restoreMovement()
-        end
-    end,
-})
-
-Tab:CreateSlider({
-    name = "Burst Amount",
-    flag = "BurstAmount",
-    range = {1, 20},
-    increment = 1,
-    suffix = " hits",
-    currentValue = CFG.BurstAmount,
-
-    callback = function(v)
-        CFG.BurstAmount = v
-    end,
-})
-
-Tab:CreateSlider({
-    name = "Burst Delay",
-    flag = "BurstDelay",
-    range = {0.01, 0.5},
-    increment = 0.01,
-    suffix = " s",
-    currentValue = CFG.BurstDelay,
-
-    callback = function(v)
-        CFG.BurstDelay = v
-    end,
-})
-
-Tab:CreateSlider({
-    name = "Harvest Range",
-    flag = "HarvestRange",
-    range = {5, 25},
-    increment = 1,
-    suffix = " studs",
-    currentValue = CFG.HarvestRange,
-
-    callback = function(v)
-        CFG.HarvestRange = v
-    end,
-})
-
-Tab:CreateSlider({
-    name = "Glide Speed",
-    flag = "GlideSpeed",
-    range = {10, 100},
-    increment = 5,
-    suffix = "",
-    currentValue = CFG.GlideSpeed,
-
-    callback = function(v)
-        CFG.GlideSpeed = v
-    end,
-})
-
-Tab:CreateSlider({
-    name = "Hover Height",
-    flag = "HoverHeight",
-    range = {1, 15},
-    increment = 1,
-    suffix = " studs",
-    currentValue = CFG.HoverHeight,
-
-    callback = function(v)
-        CFG.HoverHeight = v
-    end,
-})
+notify("VANTA Berry Harvest", "Loaded. Turn Auto Harvest on.")
