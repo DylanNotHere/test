@@ -1,5 +1,5 @@
 --==================================================
--- VANTA | COMBAT & RESOURCE HUB (Noclip)
+-- VANTA | COMBAT & RESOURCE HUB (Fixed Target Lock)
 --==================================================
 
 local Players = game:GetService("Players")
@@ -30,6 +30,7 @@ local CFG = {
     BurstDelay = 0.1,
     
     WeaponType = "Scepter",
+    MobTimeout = 5, -- Max seconds to shoot a mob before switching
 }
 
 local function applyWeaponStats()
@@ -48,6 +49,11 @@ applyWeaponStats()
 
 local state = { AutoFarm = false, Mob = false, Ore = false, Tree = false, Boss = false }
 local shotCounter = 1
+
+-- TARGET LOCK STATES
+local lockedMob = nil
+local lockedRes = nil
+local lockedTimer = 0
 
 local skeletonNames = {
     ["Skeleton"] = true, ["SkeletonArcher"] = true, 
@@ -103,7 +109,7 @@ local function getChar()
 end
 
 local function isAlive(m)
-	if not m.Parent then return false end
+	if not m or not m.Parent then return false end
 	local hum = m:FindFirstChildOfClass("Humanoid")
 	if hum then return hum.Health > 0 end
 	return true
@@ -111,7 +117,7 @@ end
 
 local bodyPos, bodyGyro
 local function startGlidePhysics(hum, root)
-    if bodyPos then return end
+    if bodyPos and bodyPos.Parent then return end
     hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
     
     bodyPos = Instance.new("BodyPosition")
@@ -229,8 +235,14 @@ local function shootMob(model, isBoss)
     
     local hum, root = getChar()
     local lastShoot = 0
+    local lockTime = os.clock()
     
     while state.AutoFarm and isAlive(model) and (mobRoot.Position - root.Position).Magnitude <= CFG.ShootRange + 5 do
+        -- Timeout check: if stuck on this mob for too long, break to find another
+        if os.clock() - lockTime > CFG.MobTimeout then
+            break
+        end
+        
         if os.clock() - lastShoot >= CFG.ShootDelay then
             lastShoot = os.clock()
             local dir = (mobRoot.Position - root.Position).Unit
@@ -254,7 +266,12 @@ local function mineResource(hb, isTree)
     bodyPos.Position = targetPos
     
     local hum, root = getChar()
+    local lockTime = os.clock()
+    
     while state.AutoFarm and hb.Parent and (root.Position - hb.Position).Magnitude <= 15 do
+        -- Timeout check for resources too
+        if os.clock() - lockTime > CFG.MobTimeout then break end
+        
         for i = 1, CFG.BurstAmount do
             if not hb.Parent then break end
             pcall(function() RS.Remotes.RequestSwing:FireServer(hb) end)
@@ -271,6 +288,7 @@ local function farmLoop()
     while state.AutoFarm do
         local hum, root = getChar()
         if not hum then 
+            stopGlidePhysics() -- Clean up physics if we died
             task.wait(1) 
         else
             startGlidePhysics(hum, root)
