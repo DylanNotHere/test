@@ -1,644 +1,426 @@
--- berryplanter_v1.0.0
--- 1. Hold your Berry Bush Seed and turn Auto Plant on.
--- 2. Plant ONE berry bush by hand on a grass block of your platform.
---    The script watches what your game sends when you do that (the remote and its arguments) and learns it.
--- 3. It then plants every other spot the same way: gliding along the platform in a snake path (berry farm
---    speed), hovering just above each block, sending the learned call for that block, and checking that a
---    bush really appeared before moving on.
--- Spacing 1 plants every block; 2 plants every second block in both directions, and so on.
+
+--==================================================
+-- VANTA | MULTI-TARGET BERRY HARVESTER v2.0
+-- HEARTBEAT GLIDE + 12-HIT MULTI-BURST + SNAKE SWEEP
+--==================================================
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+
 local player = Players.LocalPlayer
+local HarvestRemote = RS:WaitForChild("Remotes"):WaitForChild("RequestHarvest")
 
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
 
--- send both lowercase and Capitalised keys so either UI style works
-local function dual(t)
-	local out = {}
-	for k, v in pairs(t) do
-		out[k] = v
-		out[k:sub(1, 1):upper() .. k:sub(2)] = v
-	end
-	return out
-end
+local Window = Rayfield:CreateWindow({
+    name = "VANTA | Berry Harvester",
+    loadingTitle = "VANTA",
+    loadingSubtitle = "Multi-Burst v2.0",
+})
 
-local Window = Rayfield:CreateWindow(dual({
-	name = "VANTA | Berry Planter",
-	loadingTitle = "VANTA",
-	loadingSubtitle = "Plant berries",
-}))
-local Tab = Window:CreateTab(dual({ name = "Planter" }))
+local Tab = Window:CreateTab({ name = "Farm" })
 
 local CFG = {
-	Spacing = 1,        -- 1 = every block, 2 = every second block, ...
-	PlantDelay = 0.15,  -- pause after each plant (seconds); it slows itself down if plants aren't confirmed
-	MaxDelay = 1.5,
-	ConfirmTimeout = 2, -- seconds to wait for a bush to appear after planting
-	MaxMisses = 4,      -- stop after this many unconfirmed plants in a row
-	GlideSpeed = 30,    -- studs per second (same as the berry farm)
-	HoverHeight = 4,    -- studs above the block you hover while planting
+    GlideSpeed = 40,
+    HoverHeight = 3,
+    GlideTimeout = 10,
+
+    HarvestRange = 14,
+    MoveDistance = 6,
+
+    BurstAmount = 12,
+    BurstDelay = 0.05,
+    RefireDelay = 0.1,
+
+    PortalPos = Vector3.new(3044.90649, 209.518799, -17.9989929),
+    AvoidRadius = 20,
 }
 
-local KEY_PATTERN = "^(-?%d+),(-?%d+),(-?%d+)$"
+local enabled = false
+local freefallWasEnabled = true
 
-local function fmt(x, y, z)
-	return string.format("%d,%d,%d", x, y, z)
-end
+--==================================================
+-- CHARACTER
+--==================================================
 
-local function notify(title, content)
-	pcall(function()
-		Rayfield:Notify(dual({ title = title, content = content, duration = 5 }))
-	end)
-end
-
--- readable version of a value, for the console
-local function show(v, depth)
-	depth = depth or 0
-	local t = typeof(v)
-	if t == "string" then return ("%q"):format(v) end
-	if t == "Instance" then return v:GetFullName() end
-	if t == "table" then
-		if depth >= 2 then return "{...}" end
-		local parts = {}
-		for k, val in pairs(v) do
-			parts[#parts + 1] = tostring(k) .. "=" .. show(val, depth + 1)
-			if #parts >= 8 then break end
-		end
-		return "{" .. table.concat(parts, ", ") .. "}"
-	end
-	return tostring(v)
-end
-
-local function showCall(call)
-	local parts = {}
-	for i = 1, call.args.n do parts[i] = show(call.args[i]) end
-	return call.remote.Name .. "(" .. table.concat(parts, ", ") .. ")"
-end
-
--- ===== state =====
-local Enabled = false
-local RunId = 0
-
-local BlocksFolder, NodesFolder
-local occupied = {}  -- ["x,y,z"] = block
-local blockKey = {}  -- [block] = "x,y,z"
-local conns = {}
-
-local function findIsland()
-	local fallback
-	for _, c in ipairs(workspace:GetChildren()) do
-		if c.Name:match("^Island_") and c:FindFirstChild("Blocks") then
-			if c.Name:find(tostring(player.UserId), 1, true) then return c end
-			fallback = fallback or c
-		end
-	end
-	return fallback
-end
-
-local function register(block)
-	local key = block:GetAttribute("CellKey")
-	if key then
-		occupied[key] = block
-		blockKey[block] = key
-		return
-	end
-	local conn
-	conn = block:GetAttributeChangedSignal("CellKey"):Connect(function()
-		local k = block:GetAttribute("CellKey")
-		if k then
-			occupied[k] = block
-			blockKey[block] = k
-			conn:Disconnect()
-		end
-	end)
-	task.delay(3, function()
-		if conn.Connected then conn:Disconnect() end
-	end)
-end
-
-local function unregister(block)
-	local key = blockKey[block]
-	if key then
-		if occupied[key] == block then occupied[key] = nil end
-		blockKey[block] = nil
-	end
-end
-
-local function blockPos(b)
-	if b:IsA("BasePart") then return b.Position end
-	return b:GetPivot().Position
-end
-
-local function parseKey(key)
-	local x, y, z = key:match(KEY_PATTERN)
-	return tonumber(x), tonumber(y), tonumber(z)
-end
-
--- ===== your seeds =====
-local seedKey, seedCount
-do
-	local inv = RS:WaitForChild("Remotes"):FindFirstChild("InventoryChanged")
-	if inv then
-		inv.OnClientEvent:Connect(function(items)
-			if type(items) ~= "table" then return end
-			if not seedKey then
-				for name in pairs(items) do
-					if type(name) == "string" then
-						local n = name:lower()
-						if n:find("berry", 1, true) and n:find("seed", 1, true) then
-							seedKey = name
-							break
-						end
-					end
-				end
-			end
-			if seedKey then
-				seedCount = items[seedKey] or 0
-			end
-		end)
-	end
-end
-
--- ===== watching what your game sends =====
-local hookOk = type(hookmetamethod) == "function" and type(getnamecallmethod) == "function"
-local hookInstalled = false
-local watching = false
-local recent = {} -- recent outgoing remote calls
-local IGNORE = { RequestSwing = true, RequestEquipSlot = true }
-
-local function installHook()
-	if hookInstalled then return true end
-	if not hookOk then return false end
-	hookInstalled = true
-	local old
-	local wrap = newcclosure or function(f) return f end
-	old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
-		if watching and getnamecallmethod() == "FireServer" and typeof(self) == "Instance"
-			and self.ClassName == "RemoteEvent" and not IGNORE[self.Name] then
-			recent[#recent + 1] = { remote = self, args = table.pack(...), t = os.clock() }
-			if #recent > 30 then table.remove(recent, 1) end
-		end
-		return old(self, ...)
-	end))
-	return true
-end
-
--- ===== learning the planting call =====
-local learned -- { remote, args (packed), ref = the block it was planted on }
-
--- which grass block does a call argument point at?
-local function resolveBlock(v)
-	local t = typeof(v)
-	if t == "Instance" then
-		if v.Parent == BlocksFolder then return v end
-	elseif t == "table" then
-		if type(v.x) == "number" and type(v.y) == "number" and type(v.z) == "number" then
-			return occupied[fmt(v.x, v.y, v.z)] or occupied[fmt(v.x, v.y - 1, v.z)]
-		end
-	elseif t == "string" then
-		local x, y, z = parseKey(v)
-		if x then return occupied[fmt(x, y, z)] or occupied[fmt(x, y - 1, z)] end
-	elseif t == "Vector3" or t == "CFrame" then
-		local p = t == "CFrame" and v.Position or v
-		if t == "Vector3" and v.Magnitude < 1.5 then return nil end -- a direction, not a position
-		local best, bestD
-		for _, b in pairs(occupied) do
-			if b.Parent then
-				local d = (blockPos(b) - p).Magnitude
-				if not bestD or d < bestD then best, bestD = b, d end
-			end
-		end
-		if best and bestD < 8 then return best end
-	end
-end
-
-local function identifyRef(args)
-	for i = 1, args.n do
-		local b = resolveBlock(args[i])
-		if b then return b end
-	end
-end
-
--- called when something shows that planting just happened (a bush appeared, or a seed was used)
-local function tryLearn(reason)
-	if learned or not watching then return end
-	local now = os.clock()
-	for i = #recent, 1, -1 do
-		local c = recent[i]
-		if now - c.t <= 2.5 then
-			local ref = identifyRef(c.args)
-			if ref then
-				learned = { remote = c.remote, args = c.args, ref = ref }
-				watching = false
-				print(("[Planter] learned (%s): %s"):format(reason, showCall(learned)))
-				print("[Planter] planted on block " .. tostring(blockKey[ref]))
-				notify("Learned the planting call", learned.remote.Name .. ". Planting the rest now.")
-				return true
-			end
-		end
-	end
-end
-
--- same call, aimed at another block
-local function retarget(call, target)
-	local ref = call.ref
-	local rx, ry, rz = parseKey(blockKey[ref])
-	local tx, ty, tz = parseKey(blockKey[target])
-	local dx, dz = tx - rx, tz - rz
-	local worldDelta = blockPos(target) - blockPos(ref)
-
-	local out = {}
-	for i = 1, call.args.n do
-		local v = call.args[i]
-		local t = typeof(v)
-		if t == "Instance" then
-			if v == ref then
-				out[i] = target
-			elseif v.Parent == BlocksFolder and blockKey[v] then
-				local x, y, z = parseKey(blockKey[v])
-				local nb = occupied[fmt(x + dx, y, z + dz)]
-				if not nb then return nil end
-				out[i] = nb
-			else
-				out[i] = v
-			end
-		elseif t == "table" and type(v.x) == "number" and type(v.y) == "number" and type(v.z) == "number" then
-			local copy = {}
-			for k, val in pairs(v) do copy[k] = val end
-			copy.x, copy.z = v.x + dx, v.z + dz
-			out[i] = copy
-		elseif t == "string" and v:match(KEY_PATTERN) then
-			local x, y, z = parseKey(v)
-			out[i] = fmt(x + dx, y, z + dz)
-		elseif t == "Vector3" and v.Magnitude > 1.5 then
-			out[i] = v + worldDelta
-		elseif t == "CFrame" then
-			out[i] = v + worldDelta
-		else
-			out[i] = v
-		end
-	end
-	return out
-end
-
--- ===== bushes that already exist / just appeared (matched to blocks by position) =====
-local bushes = {}         -- ["i,j"] = true, in lattice coordinates around the learned block
-local lattice = nil       -- { origin, vx, vz }
-
-local function buildLattice(ref)
-	local rx, ry, rz = parseKey(blockKey[ref])
-	local origin = blockPos(ref)
-	local vx, vz
-	for _, s in ipairs({ 1, -1 }) do
-		local nb = occupied[fmt(rx + s, ry, rz)]
-		if nb then vx = (blockPos(nb) - origin) * s break end
-	end
-	for _, s in ipairs({ 1, -1 }) do
-		local nb = occupied[fmt(rx, ry, rz + s)]
-		if nb then vz = (blockPos(nb) - origin) * s break end
-	end
-	if vx and vz then
-		lattice = { origin = origin, vx = vx, vz = vz }
-	else
-		lattice = nil
-	end
-end
-
-local function latticeOf(pos)
-	if not lattice then return nil end
-	local d = pos - lattice.origin
-	local i = math.floor(d:Dot(lattice.vx) / lattice.vx:Dot(lattice.vx) + 0.5)
-	local j = math.floor(d:Dot(lattice.vz) / lattice.vz:Dot(lattice.vz) + 0.5)
-	return i, j
-end
-
-local function isBush(inst)
-	return inst.Name:lower():find("berry", 1, true) ~= nil
-end
-
-local function markBush(inst)
-	if not lattice then return end
-	local ok, pos = pcall(function()
-		local hb = inst:FindFirstChild("HB")
-		if hb and hb:IsA("BasePart") then return hb.Position end
-		return inst:GetPivot().Position
-	end)
-	if ok and pos then
-		local i, j = latticeOf(pos)
-		if i then bushes[i .. "," .. j] = true end
-	end
-end
-
--- ===== moving: glide + hover =====
 local function getChar()
-	local char = player.Character
-	if not char then return end
-	local hum = char:FindFirstChildOfClass("Humanoid")
-	local root = char:FindFirstChild("HumanoidRootPart")
-	if hum and root and hum.Health > 0 then
-		return hum, root
-	end
+    local char = player.Character
+    if not char then return end
+
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+
+    if hum and root and hum.Health > 0 then
+        return hum, root
+    end
 end
 
-local hoverCF, hoverConn
+--==================================================
+-- PORTAL CHECK
+--==================================================
 
-local function startHover(hum, root)
-	if hoverConn then return end
-	hoverCF = root.CFrame
-	hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false) -- no falling pose while hovering
-	hoverConn = RunService.Heartbeat:Connect(function()
-		if root.Parent then
-			root.CFrame = hoverCF -- hold position so you don't drop between moves
-			root.AssemblyLinearVelocity = Vector3.zero
-			if hum:GetState() == Enum.HumanoidStateType.Freefall then
-				hum:ChangeState(Enum.HumanoidStateType.Running)
-			end
-		end
-	end)
+local function isNearPortal(pos)
+    local flatPos = Vector3.new(pos.X, 0, pos.Z)
+    local flatPortal = Vector3.new(
+        CFG.PortalPos.X,
+        0,
+        CFG.PortalPos.Z
+    )
+
+    return (flatPos - flatPortal).Magnitude < CFG.AvoidRadius
 end
 
-local function stopHover()
-	if hoverConn then
-		hoverConn:Disconnect()
-		hoverConn = nil
-	end
-	hoverCF = nil
-	local hum = getChar()
-	if hum then
-		hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
-		hum:Move(Vector3.zero, false)
-	end
+--==================================================
+-- ISLAND NODES
+--==================================================
+
+local function getNodesFolder()
+    local fallback
+
+    for _, island in ipairs(workspace:GetChildren()) do
+        if island.Name:match("^Island_") then
+            local nodes = island:FindFirstChild("Nodes")
+
+            if nodes then
+                if island.Name:find(tostring(player.UserId), 1, true) then
+                    return nodes
+                end
+
+                fallback = fallback or nodes
+            end
+        end
+    end
+
+    return fallback
 end
 
-local function glideAbove(pos, offset, run)
-	local hum, root = getChar()
-	if not hum then return false end
-	startHover(hum, root)
+--==================================================
+-- HEARTBEAT GLIDE
+-- Uses the movement style from your Slime Farmer
+--==================================================
 
-	local goal = pos + Vector3.new(0, offset, 0)
-	while Enabled and run == RunId do
-		if hum.Health <= 0 then return false end
-		local d = goal - hoverCF.Position
-		if d.Magnitude <= 0.75 then break end
+local function glideTo(hum, root, destination)
+    if not enabled or not root.Parent or hum.Health <= 0 then
+        return false
+    end
 
-		local dt = RunService.Heartbeat:Wait()
-		hoverCF = hoverCF + d.Unit * math.min(CFG.GlideSpeed * dt, d.Magnitude)
+    local startTime = os.clock()
+    local targetPos = destination + Vector3.new(0, CFG.HoverHeight, 0)
 
-		local flat = Vector3.new(d.X, 0, d.Z) -- plays the walking animation while gliding
-		hum:Move(flat.Magnitude > 1 and flat.Unit or Vector3.zero, false)
-	end
+    freefallWasEnabled = true
+    hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
 
-	hum:Move(Vector3.zero, false)
-	return true
+    while enabled
+        and root.Parent
+        and hum.Health > 0
+        and os.clock() - startTime < CFG.GlideTimeout do
+
+        local offset = targetPos - root.Position
+
+        if offset.Magnitude <= 4 then
+            hum:Move(Vector3.zero, false)
+            root.AssemblyLinearVelocity = Vector3.zero
+            return true
+        end
+
+        local dt = RunService.Heartbeat:Wait()
+
+        if not enabled or not root.Parent then
+            break
+        end
+
+        offset = targetPos - root.Position
+
+        if offset.Magnitude > 0.05 then
+            local step = math.min(CFG.GlideSpeed * dt, offset.Magnitude)
+            root.CFrame = root.CFrame + offset.Unit * step
+        end
+
+        root.AssemblyLinearVelocity = Vector3.zero
+
+        local flat = Vector3.new(offset.X, 0, offset.Z)
+        hum:Move(
+            flat.Magnitude > 1 and flat.Unit or Vector3.zero,
+            false
+        )
+
+        if hum:GetState() == Enum.HumanoidStateType.Freefall then
+            hum:ChangeState(Enum.HumanoidStateType.Running)
+        end
+    end
+
+    hum:Move(Vector3.zero, false)
+    return false
 end
 
--- ===== planting =====
-local planting = false
+local function restoreMovement()
+    local hum = getChar()
 
--- every grass block on the platform's layer, as a snake path
-local function buildTargets()
-	local ref = learned.ref
-	local rx, ry, rz = parseKey(blockKey[ref])
-	local refId = ref:GetAttribute("BlockId")
-	local S = math.max(1, math.floor(CFG.Spacing))
-
-	local rows = {}
-	for key, b in pairs(occupied) do
-		if b.Parent and b:GetAttribute("BlockId") == refId then
-			local x, y, z = parseKey(key)
-			if y == ry then
-				local i, j = x - rx, z - rz
-				if i % S == 0 and j % S == 0 and not bushes[i .. "," .. j] then
-					rows[j] = rows[j] or {}
-					table.insert(rows[j], { i = i, j = j, block = b })
-				end
-			end
-		end
-	end
-
-	local js = {}
-	for j in pairs(rows) do js[#js + 1] = j end
-	table.sort(js)
-
-	local targets = {}
-	for n, j in ipairs(js) do
-		local row = rows[j]
-		table.sort(row, function(a, b)
-			if n % 2 == 1 then return a.i < b.i end
-			return a.i > b.i
-		end)
-		for _, t in ipairs(row) do targets[#targets + 1] = t end
-	end
-	return targets
+    if hum then
+        hum:Move(Vector3.zero, false)
+        hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+    end
 end
 
-local function plantAll(run)
-	planting = true
-	buildLattice(learned.ref)
-	if NodesFolder then
-		for _, n in ipairs(NodesFolder:GetChildren()) do
-			if isBush(n) then markBush(n) end
-		end
-	end
-	markBush(learned.ref) -- the one planted by hand sits on this block (its bush may not be in Nodes yet)
-	do
-		local i, j = 0, 0
-		bushes[i .. "," .. j] = true
-	end
+--==================================================
+-- BUILD SNAKE GRID
+--==================================================
 
-	local targets = buildTargets()
-	print(("[Planter] %d spots to plant (spacing %d)"):format(#targets, CFG.Spacing))
-	notify("Planting", ("%d spots"):format(#targets))
+local function getTargets(nodes)
+    local rows = {}
 
-	local delay = CFG.PlantDelay
-	local planted, misses = 0, 0
+    for _, node in ipairs(nodes:GetChildren()) do
+        if node.Name == "BerryBush"
+            and node:FindFirstChild("Berries") then
 
-	for _, t in ipairs(targets) do
-		if not Enabled or run ~= RunId then break end
-		if seedCount and seedCount <= 0 then
-			notify("Out of seeds", ("Planted %d. Get more Berry Bush Seeds and turn it on again."):format(planted))
-			break
-		end
-		local key = t.i .. "," .. t.j
-		if t.block.Parent and not bushes[key] then
-			if not glideAbove(blockPos(t.block), CFG.HoverHeight, run) then break end
+            local hb = node:FindFirstChild("HB")
 
-			local args = retarget(learned, t.block)
-			if args then
-				local before = seedCount
-				learned.remote:FireServer(table.unpack(args, 1, learned.args.n))
+            if hb and hb:IsA("BasePart") and not isNearPortal(hb.Position) then
+                local z = math.floor(hb.Position.Z / 4) * 4
 
-				-- confirmed once a bush shows up on that block, or your seed count drops
-				local deadline = os.clock() + CFG.ConfirmTimeout
-				local ok = false
-				while os.clock() < deadline and Enabled and run == RunId do
-					if bushes[key] or (before and seedCount and seedCount < before) then
-						ok = true
-						break
-					end
-					task.wait(0.03)
-				end
+                rows[z] = rows[z] or {}
+                table.insert(rows[z], hb)
+            end
+        end
+    end
 
-				if ok then
-					bushes[key] = true
-					planted += 1
-					misses = 0
-					delay = math.max(CFG.PlantDelay, delay * 0.95)
-					if planted % 200 == 0 then
-						print(("[Planter] %d planted"):format(planted))
-					end
-				else
-					misses += 1
-					delay = math.min(delay * 1.6 + 0.05, CFG.MaxDelay)
-					if misses >= CFG.MaxMisses then
-						warn(("[Planter] %d plants in a row weren't confirmed, stopping. Last call: %s")
-							:format(misses, showCall({ remote = learned.remote, args = table.pack(table.unpack(args, 1, learned.args.n)) })))
-						notify("Stopped", "Plants aren't being confirmed. Check the console, or press Relearn and plant one by hand.")
-						break
-					end
-				end
-			end
-			task.wait(delay)
-		end
-	end
+    local zKeys = {}
 
-	print(("[Planter] done: %d planted"):format(planted))
-	stopHover()
-	planting = false
+    for z in pairs(rows) do
+        table.insert(zKeys, z)
+    end
+
+    table.sort(zKeys)
+
+    local targets = {}
+
+    for i, z in ipairs(zKeys) do
+        local row = rows[z]
+
+        table.sort(row, function(a, b)
+            if i % 2 == 1 then
+                return a.Position.X < b.Position.X
+            end
+
+            return a.Position.X > b.Position.X
+        end)
+
+        for _, hb in ipairs(row) do
+            table.insert(targets, hb)
+        end
+    end
+
+    return targets
 end
 
--- ===== arming =====
-local function disconnectAll()
-	for _, c in ipairs(conns) do c:Disconnect() end
-	conns = {}
+--==================================================
+-- MULTI-TARGET BURST
+-- Sends one request to every bush per round
+--==================================================
+
+local function burstCluster(cluster)
+    local valid = {}
+
+    for _, hb in ipairs(cluster) do
+        if hb and hb.Parent then
+            table.insert(valid, hb)
+        end
+    end
+
+    for hit = 1, CFG.BurstAmount do
+        if not enabled then
+            break
+        end
+
+        local fired = 0
+
+        for _, hb in ipairs(valid) do
+            if not enabled then
+                break
+            end
+
+            if hb and hb.Parent then
+                HarvestRemote:FireServer(hb)
+                fired += 1
+            end
+        end
+
+        if fired == 0 then
+            break
+        end
+
+        if hit < CFG.BurstAmount then
+            task.wait(CFG.BurstDelay)
+        end
+    end
+
+    task.wait(CFG.RefireDelay)
 end
 
-local function startWhenLearned(run)
-	task.spawn(function()
-		while Enabled and run == RunId and not learned do
-			task.wait(0.25)
-		end
-		if Enabled and run == RunId and learned and not planting then
-			plantAll(run)
-		end
-	end)
+--==================================================
+-- HARVEST LOOP
+--==================================================
+
+local function harvestLoop()
+    while enabled do
+        local hum, root = getChar()
+        local nodes = getNodesFolder()
+
+        if hum and root and nodes then
+            local targets = getTargets(nodes)
+            local processed = {}
+            local currentIndex = 1
+
+            while currentIndex <= #targets and enabled do
+                hum, root = getChar()
+
+                if not hum or not root then
+                    break
+                end
+
+                local primaryHB = targets[currentIndex]
+
+                if not primaryHB
+                    or not primaryHB.Parent
+                    or processed[primaryHB]
+                    or isNearPortal(primaryHB.Position) then
+
+                    currentIndex += 1
+                    continue
+                end
+
+                -- Move to the next snake target
+                local arrived = glideTo(hum, root, primaryHB.Position)
+
+                if not enabled then
+                    break
+                end
+
+                if not arrived then
+                    -- Avoid getting stuck on unreachable targets
+                    processed[primaryHB] = true
+                    currentIndex += 1
+                    continue
+                end
+
+                -- Collect every unprocessed bush in range
+                local cluster = {}
+
+                for _, checkHB in ipairs(targets) do
+                    if checkHB
+                        and checkHB.Parent
+                        and not processed[checkHB]
+                        and not isNearPortal(checkHB.Position)
+                        and (checkHB.Position - primaryHB.Position).Magnitude
+                            <= CFG.HarvestRange then
+
+                        table.insert(cluster, checkHB)
+                    end
+                end
+
+                if #cluster > 0 then
+                    -- Mark before firing so targets aren't repeated
+                    for _, hb in ipairs(cluster) do
+                        processed[hb] = true
+                    end
+
+                    burstCluster(cluster)
+                else
+                    processed[primaryHB] = true
+                end
+
+                currentIndex += 1
+            end
+        end
+
+        task.wait(0.5)
+    end
+
+    restoreMovement()
 end
 
-local function arm()
-	local island = findIsland()
-	BlocksFolder = island and island:FindFirstChild("Blocks")
-	NodesFolder = island and island:FindFirstChild("Nodes")
-	if not BlocksFolder then
-		warn("[Planter] couldn't find your island's Blocks folder")
-		return false
-	end
+--==================================================
+-- UI
+--==================================================
 
-	occupied, blockKey, bushes = {}, {}, {}
-	for _, b in ipairs(BlocksFolder:GetChildren()) do register(b) end
+Tab:CreateToggle({
+    name = "Auto Harvest (Multi-Burst)",
+    flag = "AutoHarvest",
+    currentValue = false,
 
-	table.insert(conns, BlocksFolder.ChildAdded:Connect(register))
-	table.insert(conns, BlocksFolder.ChildRemoved:Connect(unregister))
+    callback = function(on)
+        enabled = on
 
-	if NodesFolder then
-		table.insert(conns, NodesFolder.ChildAdded:Connect(function(n)
-			task.wait(0.1)
-			if isBush(n) then
-				if learned then
-					markBush(n)
-				else
-					tryLearn("a bush appeared")
-				end
-			end
-		end))
-	end
+        if on then
+            task.spawn(harvestLoop)
+        else
+            restoreMovement()
+        end
+    end,
+})
 
-	-- a dropped seed count also means you just planted something
-	local lastSeeds = seedCount
-	table.insert(conns, RunService.Heartbeat:Connect(function()
-		if not learned and seedCount and lastSeeds and seedCount < lastSeeds then
-			tryLearn("a seed was used")
-		end
-		lastSeeds = seedCount
-	end))
-	return true
-end
+Tab:CreateSlider({
+    name = "Burst Amount",
+    flag = "BurstAmount",
+    range = {1, 20},
+    increment = 1,
+    suffix = " hits",
+    currentValue = CFG.BurstAmount,
 
--- ===== UI =====
-Tab:CreateToggle(dual({
-	name = "Auto Plant",
-	flag = "AutoPlant",
-	currentValue = false,
-	callback = function(on)
-		Enabled = on
-		RunId += 1
-		disconnectAll()
+    callback = function(v)
+        CFG.BurstAmount = v
+    end,
+})
 
-		if not on then
-			watching = false
-			notify("Auto Plant off", "Stopped.")
-			return
-		end
+Tab:CreateSlider({
+    name = "Burst Delay",
+    flag = "BurstDelay",
+    range = {0.01, 0.5},
+    increment = 0.01,
+    suffix = " s",
+    currentValue = CFG.BurstDelay,
 
-		if not arm() then return end
+    callback = function(v)
+        CFG.BurstDelay = v
+    end,
+})
 
-		if learned then
-			notify("Auto Plant on", "Using the planting call it already learned.")
-			startWhenLearned(RunId)
-		else
-			if not installHook() then
-				warn("[Planter] your executor can't watch remote calls (no hookmetamethod).")
-				notify("Can't learn here", "Send me a Cobalt capture of planting one berry bush instead.")
-				return
-			end
-			watching = true
-			notify("Plant ONE berry bush by hand", "Hold the Berry Bush Seed and plant one on a grass block. I'll do the rest.")
-			startWhenLearned(RunId)
-		end
-	end,
-}))
+Tab:CreateSlider({
+    name = "Harvest Range",
+    flag = "HarvestRange",
+    range = {5, 25},
+    increment = 1,
+    suffix = " studs",
+    currentValue = CFG.HarvestRange,
 
-pcall(function()
-	Tab:CreateSlider(dual({
-		name = "Spacing (1 = every block)",
-		flag = "PlantSpacing",
-		range = { 1, 5 },
-		increment = 1,
-		suffix = " blocks",
-		currentValue = CFG.Spacing,
-		callback = function(v) CFG.Spacing = math.floor(v) end,
-	}))
-end)
+    callback = function(v)
+        CFG.HarvestRange = v
+    end,
+})
 
-pcall(function()
-	Tab:CreateSlider(dual({
-		name = "Plant Delay",
-		flag = "PlantDelay",
-		range = { 0.03, 1 },
-		increment = 0.01,
-		suffix = " s",
-		currentValue = CFG.PlantDelay,
-		callback = function(v) CFG.PlantDelay = v end,
-	}))
-end)
+Tab:CreateSlider({
+    name = "Glide Speed",
+    flag = "GlideSpeed",
+    range = {10, 100},
+    increment = 5,
+    suffix = "",
+    currentValue = CFG.GlideSpeed,
 
-pcall(function()
-	Tab:CreateButton(dual({
-		name = "Relearn (plant one by hand again)",
-		callback = function()
-			learned = nil
-			bushes = {}
-			if Enabled then
-				RunId += 1
-				watching = hookOk and installHook()
-				notify("Relearning", "Plant ONE berry bush by hand.")
-				startWhenLearned(RunId)
-			else
-				notify("Forgot the planting call", "Turn Auto Plant on and plant one by hand.")
-			end
-		end,
-	}))
-end)
+    callback = function(v)
+        CFG.GlideSpeed = v
+    end,
+})
 
-notify("VANTA Berry Planter", "Loaded. Hold your seed, turn Auto Plant on, plant one bush by hand.")
+Tab:CreateSlider({
+    name = "Hover Height",
+    flag = "HoverHeight",
+    range = {1, 15},
+    increment = 1,
+    suffix = " studs",
+    currentValue = CFG.HoverHeight,
+
+    callback = function(v)
+        CFG.HoverHeight = v
+    end,
+})
