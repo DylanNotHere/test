@@ -51,9 +51,9 @@ local state = { AutoFarm = false, Mob = false, Ore = false, Tree = false, Boss =
 local shotCounter = 1
 
 -- TARGET LOCK STATES
-local lockedMob = nil
-local lockedRes = nil
-local lockedTimer = 0
+local lockedTarget = nil
+local lockedIsMob = false
+local lockTime = 0
 
 local skeletonNames = {
     ["Skeleton"] = true, ["SkeletonArcher"] = true, 
@@ -145,13 +145,12 @@ end
 --==================================================
 -- TARGETING
 --==================================================
-local function getNearestMob(root)
+local function findNearestMob(root)
 	local ruins = workspace:FindFirstChild("Ruins")
 	local ruinsBoss = workspace:FindFirstChild("RuinsBoss")
 	local best, bestDist = nil, math.huge
     local isBoss = false
 
-	-- Boss Priority
 	if state.Boss and ruinsBoss then
 		for _, inst in ipairs(ruinsBoss:GetDescendants()) do
 			if inst:IsA("Model") and bossNames[inst.Name] and isAlive(inst) then
@@ -171,7 +170,7 @@ local function getNearestMob(root)
                     if mobRoot then
                         local d = (mobRoot.Position - root.Position).Magnitude
                         if d < bestDist then
-                            best = inst; bestDist = d
+                            best = inst; bestDist = d; isBoss = false
                         end
                     end
 				end
@@ -182,7 +181,7 @@ local function getNearestMob(root)
 	return best, isBoss
 end
 
-local function getNearestResource(root)
+local function findNearestResource(root)
     local ruins = workspace:FindFirstChild("Ruins")
     local folder = ruins and ruins:FindFirstChild("ResourceField")
     if not folder then return nil end
@@ -235,12 +234,10 @@ local function shootMob(model, isBoss)
     
     local hum, root = getChar()
     local lastShoot = 0
-    local lockTime = os.clock()
     
     while state.AutoFarm and isAlive(model) and (mobRoot.Position - root.Position).Magnitude <= CFG.ShootRange + 5 do
-        -- Timeout check: if stuck on this mob for too long, break to find another
         if os.clock() - lockTime > CFG.MobTimeout then
-            break
+            break -- Timeout, find a new mob
         end
         
         if os.clock() - lastShoot >= CFG.ShootDelay then
@@ -266,10 +263,8 @@ local function mineResource(hb, isTree)
     bodyPos.Position = targetPos
     
     local hum, root = getChar()
-    local lockTime = os.clock()
     
     while state.AutoFarm and hb.Parent and (root.Position - hb.Position).Magnitude <= 15 do
-        -- Timeout check for resources too
         if os.clock() - lockTime > CFG.MobTimeout then break end
         
         for i = 1, CFG.BurstAmount do
@@ -288,22 +283,46 @@ local function farmLoop()
     while state.AutoFarm do
         local hum, root = getChar()
         if not hum then 
-            stopGlidePhysics() -- Clean up physics if we died
+            stopGlidePhysics()
             task.wait(1) 
         else
             startGlidePhysics(hum, root)
             
-            local targetMob, isBoss = getNearestMob(root)
-            
-            if targetMob then
-                shootMob(targetMob, isBoss)
-            else
-                local targetRes, isTree = getNearestResource(root)
-                if targetRes then
-                    mineResource(targetRes, isTree)
-                else
-                    task.wait(0.5)
+            -- 1. Check if current locked target is dead or missing
+            if lockedTarget then
+                if not isAlive(lockedTarget) or (os.clock() - lockTime > CFG.MobTimeout) then
+                    lockedTarget = nil
                 end
+            end
+            
+            -- 2. If no target locked, find a new one
+            if not lockedTarget then
+                local targetMob, isBoss = findNearestMob(root)
+                if targetMob then
+                    lockedTarget = targetMob
+                    lockedIsMob = true
+                    lockTime = os.clock()
+                else
+                    local targetRes, isTree = findNearestResource(root)
+                    if targetRes then
+                        lockedTarget = targetRes
+                        lockedIsMob = false
+                        lockTime = os.clock()
+                    end
+                end
+            end
+            
+            -- 3. Execute action on locked target
+            if lockedTarget then
+                if lockedIsMob then
+                    local isBoss = bossNames[lockedTarget.Name] or false
+                    shootMob(lockedTarget, isBoss)
+                else
+                    local isTree = (lockedTarget.Parent and (lockedTarget.Parent.Name:find("Pine") or lockedTarget.Parent.Name:find("Tree"))) or false
+                    mineResource(lockedTarget, isTree)
+                end
+            else
+                task.wait(0.5)
             end
         end
     end
@@ -328,7 +347,12 @@ Tab:CreateToggle({
     currentValue = false,
     callback = function(on)
         state.AutoFarm = on
-        if on then task.spawn(farmLoop) else stopGlidePhysics() end
+        if on then 
+            task.spawn(farmLoop) 
+        else 
+            lockedTarget = nil
+            stopGlidePhysics() 
+        end
     end,
 })
 
@@ -343,7 +367,7 @@ Tab:CreateDropdown({
     end,
 })
 
-Tab:CreateToggle({ name = "Farm Mobs", flag = "T_Mob", currentValue = true, callback = function(on) state.Mob = on end })
-Tab:CreateToggle({ name = "Farm Boss (Morten)", flag = "T_Boss", currentValue = false, callback = function(on) state.Boss = on end })
-Tab:CreateToggle({ name = "Farm Ores", flag = "T_Ore", currentValue = true, callback = function(on) state.Ore = on end })
-Tab:CreateToggle({ name = "Farm Trees", flag = "T_Tree", currentValue = true, callback = function(on) state.Tree = on end })
+Tab:CreateToggle({ name = "Farm Mobs", flag = "T_Mob", currentValue = true, callback = function(on) state.Mob = on; lockedTarget = nil end })
+Tab:CreateToggle({ name = "Farm Boss (Morten)", flag = "T_Boss", currentValue = false, callback = function(on) state.Boss = on; lockedTarget = nil end })
+Tab:CreateToggle({ name = "Farm Ores", flag = "T_Ore", currentValue = true, callback = function(on) state.Ore = on; lockedTarget = nil end })
+Tab:CreateToggle({ name = "Farm Trees", flag = "T_Tree", currentValue = true, callback = function(on) state.Tree = on; lockedTarget = nil end })
