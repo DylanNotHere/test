@@ -1,373 +1,1589 @@
---==================================================
--- VANTA | COMBAT & RESOURCE HUB (Fixed Target Lock)
---==================================================
+-- slimefarmer_v3.1.0 (Above Farm: slimes + berries + simple auto craft + settings)
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+
+local window = Rayfield:CreateWindow({
+	name = "Above Farm",
+	loadingTitle = "VANTA",
+	loadingSubtitle = "by dj",
+})
+
+local main = window:CreateTab({ name = "Combat" })
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
+local PathfindingService = game:GetService("PathfindingService")
 local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
-
-local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
-
-local Window = Rayfield:CreateWindow({
-    name = "VANTA | Farm Hub",
-    loadingTitle = "VANTA",
-    loadingSubtitle = "Combat & Resources",
-})
-
-local Tab = Window:CreateTab({ name = "Farm" })
+local Remotes = RS:WaitForChild("Remotes")
 
 local CFG = {
-    GlideSpeed = 45,
-    MobHoverHeight = 20,
-    BossHoverHeight = 20,
-    TreeHoverHeight = 6,
-    OreHoverHeight = -5,
-    
-    ShootDelay = 0.25,
-    BurstAmount = 3,
-    BurstDelay = 0.1,
-    
-    WeaponType = "Scepter",
-    MobTimeout = 5, -- Max seconds to shoot a mob before switching
+	WalkSpeed = nil,          -- nil = leave the game's speed alone (default Roblox is 16)
+	DirectWalk = true,       -- skip pathfinding and walk straight when nothing is in the way (much faster)
+	Tween = false,           -- true = glide to the slime instead of walking (off: normal walking)
+	TweenSpeed = 30,         -- studs per second while gliding
+	HoverHeight = 8,         -- studs above the slime to hover (0 = stay beside it like before)
+	TweenTimeout = 6,        -- give up gliding to one slime after this many seconds
+	Teleport = false,        -- hop next to the nearest slime instead (fastest, most detectable)
+	StopDistance = 6,        -- stop walking once this close to a slime
+	SwingRange = 15,         -- only swing when a slime is within this range (set math.huge to always swing)
+	SwingsPerTick = 3,      -- RequestSwing fires per tick (your original was 10)
+	SwingDelay = 0.15,
+	WaypointTimeout = 1,     -- seconds to reach one waypoint before giving up on it
+	RetargetDistance = 8,    -- re-path if the slime moves this far from where we aimed
+	BlockedRadius = 5,
 }
 
-local function applyWeaponStats()
-    if CFG.WeaponType == "Bow" then
-        CFG.ShootRange = 50
-        CFG.WeaponName = "Bow" 
-    elseif CFG.WeaponType == "Sword" then
-        CFG.ShootRange = 15
-        CFG.WeaponName = "Sword"
-    else
-        CFG.ShootRange = 25
-        CFG.WeaponName = "Scepter"
-    end
-end
-applyWeaponStats()
-
-local state = { AutoFarm = false, Mob = false, Ore = false, Tree = false, Boss = false }
-local shotCounter = 1
-
--- TARGET LOCK STATES
-local lockedTarget = nil
-local lockedIsMob = false
-local lockTime = 0
-
-local skeletonNames = {
-    ["Skeleton"] = true, ["SkeletonArcher"] = true, 
-    ["SkeletonKnight"] = true, ["SkeletonWarrior"] = true
+local blockedSpots = {
+	Vector3.new(8, 196, -80),
+	Vector3.new(24, 192, -112),
+	Vector3.new(9, -198.5, 0),
 }
-local bossNames = { ["Morten"] = true }
 
---==================================================
--- NOCLIP
---==================================================
-local noclipEnabled = false
-local noclipConnection
+local state = { AutoEquip = false, WalkToSlime = false, AutoSwing = false }
 
-local function toggleNoclip(on)
-    noclipEnabled = on
-    if on then
-        if noclipConnection then return end
-        noclipConnection = RunService.Stepped:Connect(function()
-            local char = player.Character
-            if char then
-                for _, part in ipairs(char:GetDescendants()) do
-                    if part:IsA("BasePart") and part.CanCollide then
-                        part.CanCollide = false
-                    end
-                end
-            end
-        end)
-    else
-        if noclipConnection then
-            noclipConnection:Disconnect()
-            noclipConnection = nil
-        end
-        local char = player.Character
-        if char then
-            for _, part in ipairs(char:GetDescendants()) do
-                if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
-                    part.CanCollide = true
-                end
-            end
-        end
-    end
+-- ===== Slime cache (no more scanning the whole workspace every 0.5s) =====
+local slimes = {} -- [Model] = true
+
+local function track(inst)
+	if inst.Name == "Slime" and inst:IsA("Model") then
+		slimes[inst] = true
+	end
 end
 
---==================================================
--- UTILS & PHYSICS
---==================================================
+for _, v in ipairs(workspace:GetDescendants()) do
+	track(v)
+end
+workspace.DescendantAdded:Connect(track)
+workspace.DescendantRemoving:Connect(function(inst)
+	slimes[inst] = nil
+end)
+
+local function isBlocked(pos)
+	for _, blocked in ipairs(blockedSpots) do
+		if (pos - blocked).Magnitude < CFG.BlockedRadius then
+			return true
+		end
+	end
+	return false
+end
+
+local function isAlive(slime)
+	local hum = slime:FindFirstChildOfClass("Humanoid")
+	return not hum or hum.Health > 0
+end
+
+local function nearestSlime(fromPos)
+	local best, bestDist = nil, math.huge
+	for slime in pairs(slimes) do
+		if slime.Parent and isAlive(slime) then
+			local pos = slime:GetPivot().Position
+			local d = (pos - fromPos).Magnitude
+			if d < bestDist and not isBlocked(pos) then
+				best, bestDist = slime, d
+			end
+		end
+	end
+	return best, bestDist
+end
+
 local function getChar()
 	local char = player.Character
 	if not char then return end
 	local hum = char:FindFirstChildOfClass("Humanoid")
 	local root = char:FindFirstChild("HumanoidRootPart")
-	if hum and root and hum.Health > 0 then return hum, root end
+	if not hum or not root or hum.Health <= 0 then return end
+	return char, hum, root
 end
 
-local function isAlive(m)
-	if not m or not m.Parent then return false end
-	local hum = m:FindFirstChildOfClass("Humanoid")
-	if hum then return hum.Health > 0 end
-	return true
+-- ===== Equip =====
+local function equip()
+	pcall(function()
+		Remotes.RequestEquipSlot:FireServer("Weapon")
+	end)
 end
 
-local bodyPos, bodyGyro
-local function startGlidePhysics(hum, root)
-    if bodyPos and bodyPos.Parent then return end
-    hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
-    
-    bodyPos = Instance.new("BodyPosition")
-    bodyPos.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-    bodyPos.P = 20000
-    bodyPos.D = 2000
-    bodyPos.Position = root.Position
-    bodyPos.Parent = root
-    
-    bodyGyro = Instance.new("BodyGyro")
-    bodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
-    bodyGyro.P = 10000
-    bodyGyro.D = 1000
-    bodyGyro.CFrame = root.CFrame
-    bodyGyro.Parent = root
+-- re-equip after respawn
+player.CharacterAdded:Connect(function()
+	if state.AutoEquip then
+		task.wait(1)
+		equip()
+	end
+end)
+
+-- ===== Walking =====
+local function moveToWaypoint(hum, pos)
+	local reached = false
+	local conn = hum.MoveToFinished:Connect(function()
+		reached = true
+	end)
+	hum:MoveTo(pos)
+	local t = os.clock()
+	while not reached and state.WalkToSlime and os.clock() - t < CFG.WaypointTimeout do
+		task.wait()
+	end
+	conn:Disconnect()
 end
 
-local function stopGlidePhysics()
-    if bodyPos then bodyPos:Destroy(); bodyPos = nil end
-    if bodyGyro then bodyGyro:Destroy(); bodyGyro = nil end
-    local hum = getChar()
-    if hum then hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true) end
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+-- true if nothing solid is between us and the slime
+local function clearLine(char, root, slime)
+	rayParams.FilterDescendantsInstances = { char, slime }
+	local origin = root.Position
+	local target = slime:GetPivot().Position
+	return workspace:Raycast(origin, target - origin, rayParams) == nil
 end
 
---==================================================
--- TARGETING
---==================================================
-local function findNearestMob(root)
-	local ruins = workspace:FindFirstChild("Ruins")
-	local ruinsBoss = workspace:FindFirstChild("RuinsBoss")
-	local best, bestDist = nil, math.huge
-    local isBoss = false
+local function walkStep()
+	local char, hum, root = getChar()
+	if not hum then return end
 
-	if state.Boss and ruinsBoss then
-		for _, inst in ipairs(ruinsBoss:GetDescendants()) do
-			if inst:IsA("Model") and bossNames[inst.Name] and isAlive(inst) then
-                return inst, true
+	if CFG.WalkSpeed then
+		hum.WalkSpeed = CFG.WalkSpeed -- re-applied every step in case the game resets it
+	end
+
+	local slime, dist = nearestSlime(root.Position)
+	if not slime or (dist <= CFG.StopDistance and not (CFG.Tween and CFG.HoverHeight > 0)) then return end
+
+	local targetPos = slime:GetPivot().Position
+
+	if CFG.Teleport then
+		local away = (root.Position - targetPos) * Vector3.new(1, 0, 1)
+		local dir = away.Magnitude > 0.1 and away.Unit or Vector3.xAxis
+		root.CFrame = CFrame.new(targetPos + dir * (CFG.StopDistance - 1) + Vector3.new(0, 3, 0))
+		return
+	end
+
+	if CFG.Tween then
+		local t = os.clock()
+		local hover = Vector3.new(0, CFG.HoverHeight, 0)
+		hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false) -- no falling pose while hovering
+		while state.WalkToSlime and slime.Parent and isAlive(slime) and hum.Health > 0
+			and os.clock() - t < CFG.TweenTimeout do
+			local offset = (slime:GetPivot().Position + hover) - root.Position
+			-- beside the slime (no hover): stop once close enough
+			if CFG.HoverHeight == 0 and offset.Magnitude <= CFG.StopDistance then break end
+
+			local dt = RunService.Heartbeat:Wait()
+			if offset.Magnitude > 0.5 then
+				local step = math.min(CFG.TweenSpeed * dt, offset.Magnitude)
+				root.CFrame = root.CFrame + offset.Unit * step
+			end
+			root.AssemblyLinearVelocity = Vector3.zero -- hold position, no falling
+
+			-- play walk/idle animations instead of the falling pose
+			local flat = Vector3.new(offset.X, 0, offset.Z)
+			hum:Move(flat.Magnitude > 1 and flat.Unit or Vector3.zero, false)
+			if hum:GetState() == Enum.HumanoidStateType.Freefall then
+				hum:ChangeState(Enum.HumanoidStateType.Running)
+			end
+		end
+		hum:Move(Vector3.zero, false)
+		return
+	end
+
+	if CFG.DirectWalk and clearLine(char, root, slime) then
+		local t = os.clock()
+		while state.WalkToSlime and slime.Parent and os.clock() - t < 1 do
+			local now = slime:GetPivot().Position
+			if (now - root.Position).Magnitude <= CFG.StopDistance then break end
+			hum:MoveTo(now)
+			task.wait()
+		end
+		return
+	end
+
+	local path = PathfindingService:CreatePath({
+		AgentRadius = 2,
+		AgentHeight = 5,
+		AgentCanJump = true,
+	})
+
+	local ok = pcall(function()
+		path:ComputeAsync(root.Position, targetPos)
+	end)
+
+	if ok and path.Status == Enum.PathStatus.Success then
+		for _, wp in ipairs(path:GetWaypoints()) do
+			if not state.WalkToSlime or hum.Health <= 0 or not slime.Parent then break end
+
+			-- slime moved or we're already close enough: re-plan
+			local now = slime:GetPivot().Position
+			if (now - targetPos).Magnitude > CFG.RetargetDistance then break end
+			if (now - root.Position).Magnitude <= CFG.StopDistance then break end
+
+			if wp.Action == Enum.PathWaypointAction.Jump then
+				hum.Jump = true
+			end
+			moveToWaypoint(hum, wp.Position)
+		end
+	else
+		-- pathfinding failed: walk straight at it and jump over whatever is in the way
+		local t = os.clock()
+		while state.WalkToSlime and slime.Parent and os.clock() - t < 1.5 do
+			local now = slime:GetPivot().Position
+			if (now - root.Position).Magnitude <= CFG.StopDistance then break end
+			hum:MoveTo(now)
+			hum.Jump = true
+			task.wait(0.1)
+		end
+	end
+end
+
+-- ===== UI =====
+main:CreateToggle({
+	name = "Auto Equip Sword",
+	flag = "AutoEquip",
+	currentValue = false,
+	callback = function(on)
+		state.AutoEquip = on
+		if on then equip() end
+	end,
+})
+
+main:CreateToggle({
+	name = "Walk to Slime",
+	flag = "WalkToSlime",
+	currentValue = false,
+	callback = function(on)
+		state.WalkToSlime = on
+		if not on then
+			local _, hum = getChar()
+			if hum then
+				hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+				hum:Move(Vector3.zero, false)
+			end
+		end
+		if on then
+			task.spawn(function()
+				while state.WalkToSlime do
+					local ok, err = pcall(walkStep)
+					if not ok then warn("[SlimeFarmer] walk error: " .. tostring(err)) end
+					task.wait(0.03)
+				end
+			end)
+		end
+	end,
+})
+
+main:CreateToggle({
+	name = "Auto Swing",
+	flag = "AutoSwing",
+	currentValue = false,
+	callback = function(on)
+		state.AutoSwing = on
+		if on then
+			task.spawn(function()
+				while state.AutoSwing do
+					pcall(function()
+						local _, _, root = getChar()
+						if not root then return end
+						local _, dist = nearestSlime(root.Position)
+						if dist <= CFG.SwingRange then
+							for _ = 1, CFG.SwingsPerTick do
+								Remotes.RequestSwing:FireServer(workspace.Terrain)
+							end
+						end
+					end)
+					task.wait(CFG.SwingDelay)
+				end
+			end)
+		end
+	end,
+})
+
+
+-- =====================================================================
+-- ABOVE FARM (berries)
+-- =====================================================================
+local BCFG = {
+	NodeFilter = "Berry",   -- text the node name must contain; "" = every node
+	Hover = false,          -- true = glide above the bushes, false = walk to them
+	HoverHeight = 6,        -- studs above a bush while gliding
+	GlideSpeed = 30,        -- studs per second while gliding
+	GlideTimeout = 10,      -- give up gliding to one bush after this many seconds
+	WalkTimeout = 6,        -- give up walking to one bush after this many seconds
+	HarvestRange = 14,      -- studs from HB to fire the remote
+	Routing = "Nearest",    -- "Nearest" = sweep to the closest ready bush (clean, like v2.1); "Cluster" = chase dense spots (leaves gaps)
+	StopTolerance = 3,      -- get this close to the target bush before harvesting (14 = stop at the edge of range like v2.1)
+	SearchRadius = 45,      -- look for the best stop within this many studs
+	DistanceWeight = 0.2,   -- how much a long trip counts against a stop (1 bush = 10 points)
+	BurstSize = 4,          -- bushes fired at in one burst
+	BurstDelay = 0.15,      -- pause between bursts
+	RefireDelay = 0.5,      -- wait before firing at the same bush again (covers ping)
+	StallTime = 3,          -- give up on a bush after this many seconds with no berries removed
+	BadBushCooldown = 30,   -- seconds to ignore a bush we couldn't harvest or reach
+
+	PortalNameMatch = "portal",
+	PortalPositions = { Vector3.new(3045, 201, -18) },
+	AvoidRadius = 18,
+}
+
+state.AutoBerry = false
+
+local HarvestRemote = Remotes:WaitForChild("RequestHarvest")
+local bCooldowns = {}
+local portals, portalsLoaded = {}, false
+
+local function loadPortals()
+	if portalsLoaded then return end
+	portalsLoaded = true
+	for _, p in ipairs(BCFG.PortalPositions) do
+		table.insert(portals, p)
+	end
+	if BCFG.PortalNameMatch ~= "" then
+		for _, inst in ipairs(workspace:GetDescendants()) do
+			if inst.Name:lower():find(BCFG.PortalNameMatch, 1, true) then
+				if inst:IsA("BasePart") then
+					table.insert(portals, inst.Position)
+				elseif inst:IsA("Model") then
+					table.insert(portals, inst:GetPivot().Position)
+				end
 			end
 		end
 	end
+	print(("[AboveFarm] portals: %d"):format(#portals))
+end
 
-	if not ruins then return nil end
+local function bFlat(v)
+	return Vector3.new(v.X, 0, v.Z)
+end
 
-	if state.Mob then
-		local folder = ruins:FindFirstChild("Guardians")
-		if folder then
-			for _, inst in ipairs(folder:GetDescendants()) do
-				if inst:IsA("Model") and skeletonNames[inst.Name] and isAlive(inst) then
-					local mobRoot = inst:FindFirstChild("HumanoidRootPart")
-                    if mobRoot then
-                        local d = (mobRoot.Position - root.Position).Magnitude
-                        if d < bestDist then
-                            best = inst; bestDist = d; isBoss = false
-                        end
-                    end
+local function nearPortal(pos)
+	for _, p in ipairs(portals) do
+		if (bFlat(pos) - bFlat(p)).Magnitude < BCFG.AvoidRadius then
+			return true
+		end
+	end
+	return false
+end
+
+-- if the straight line passes through a portal zone, aim beside it instead
+local function bAimPoint(from, to)
+	local R = BCFG.AvoidRadius
+	for _, portal in ipairs(portals) do
+		local a, b, p = bFlat(from), bFlat(to), bFlat(portal)
+		local ab = b - a
+		local len2 = ab:Dot(ab)
+		if len2 > 0.01 then
+			local t = math.clamp((p - a):Dot(ab) / len2, 0, 1)
+			local closest = a + ab * t
+			if (closest - p).Magnitude < R then
+				local dir = closest - p
+				if dir.Magnitude < 0.1 then
+					dir = ab.Unit:Cross(Vector3.yAxis)
+				end
+				local out = p + dir.Unit * (R + 6)
+				return Vector3.new(out.X, to.Y, out.Z)
+			end
+		end
+	end
+	return to
+end
+
+-- ----- bush cache -----
+local bFolder, bushes, bDirty = nil, {}, true
+local bGrid = {} -- spatial buckets so range checks don't scan every bush
+
+local islandPick = { nodes = nil, t = 0 }
+
+local function nodePos(n)
+	local hb = n:FindFirstChild("HB")
+	if hb and hb:IsA("BasePart") then return hb.Position end
+	if n:IsA("BasePart") then return n.Position end
+	if n:IsA("Model") then return n:GetPivot().Position end
+end
+
+-- the island you're standing on (the closest one), not just the first island that has a Nodes folder.
+-- Works on co-op / visited islands too (e.g. "Island_2880637817:c1"). Re-checked every 20 seconds.
+local function getNodesFolder()
+	if islandPick.nodes and islandPick.nodes.Parent and os.clock() - islandPick.t < 20 then
+		return islandPick.nodes
+	end
+
+	local _, _, root = getChar()
+	local best, bestDist, fallback
+	for _, island in ipairs(workspace:GetChildren()) do
+		if island.Name:match("^Island_") then
+			local nodes = island:FindFirstChild("Nodes")
+			if nodes then
+				fallback = fallback or nodes
+				if root then
+					local kids = nodes:GetChildren()
+					local step = math.max(1, math.floor(#kids / 12)) -- a handful of samples is enough to tell islands apart
+					for i = 1, #kids, step do
+						local p = nodePos(kids[i])
+						if p then
+							local d = (p - root.Position).Magnitude
+							if not bestDist or d < bestDist then
+								best, bestDist = nodes, d
+							end
+						end
+					end
+				elseif island.Name:find(tostring(player.UserId), 1, true) then
+					best = nodes
 				end
 			end
 		end
 	end
 
-	return best, isBoss
+	local pick = best or fallback
+	if pick and pick ~= islandPick.nodes then
+		print("[AboveFarm] island: " .. pick.Parent.Name)
+	end
+	islandPick.nodes, islandPick.t = pick, os.clock()
+	return pick
 end
 
-local function findNearestResource(root)
-    local ruins = workspace:FindFirstChild("Ruins")
-    local folder = ruins and ruins:FindFirstChild("ResourceField")
-    if not folder then return nil end
+-- console line about one bush (printed for the first bush found and the first one harvested, to help debugging)
+local function describeBush(label, node)
+	local b = node:FindFirstChild("Berries")
+	local attrs = {}
+	for k, v in pairs(node:GetAttributes()) do attrs[#attrs + 1] = k .. "=" .. tostring(v) end
+	table.sort(attrs)
+	if b then
+		print(("[AboveFarm] %s: %s | Berries is a %s, transparency %s, %d children | node attributes: %s"):format(
+			label, node:GetFullName(), b.ClassName,
+			b:IsA("BasePart") and tostring(b.Transparency) or "-", #b:GetChildren(),
+			#attrs > 0 and table.concat(attrs, ", ") or "none"))
+	else
+		print(("[AboveFarm] %s: %s | no Berries object | node attributes: %s"):format(
+			label, node:GetFullName(), #attrs > 0 and table.concat(attrs, ", ") or "none"))
+	end
+end
+local printedFirstBush, printedFirstHarvest = false, false
 
-    local best, bestDist = nil, math.huge
-    local isTree = false
-
-    for _, inst in ipairs(folder:GetDescendants()) do
-        if inst:IsA("Model") and isAlive(inst) then
-            local hb = inst:FindFirstChild("Reach") or inst.PrimaryPart
-            if hb then
-                local isOre = (inst.Name:find("Ore") or inst.Name == "Coal") and state.Ore
-                local isTr = (inst.Name:find("Pine") or inst.Name:find("Tree")) and state.Tree
-                
-                if isOre or isTr then
-                    local d = (hb.Position - root.Position).Magnitude
-                    if d < bestDist then
-                        best = hb; bestDist = d; isTree = isTr
-                    end
-                end
-            end
-        end
-    end
-    return best, isTree
+local function bIsTarget(node)
+	return BCFG.NodeFilter == "" or node.Name:find(BCFG.NodeFilter, 1, true) ~= nil
 end
 
-local function equipTool(namePart)
-    local char = player.Character
-    if char then
-        local currentTool = char:FindFirstChildOfClass("Tool")
-        if not currentTool or not currentTool.Name:find(namePart) then
-            RS.Remotes.RequestEquipSlot:FireServer(namePart)
-            task.wait(0.4)
-        end
-    end
+local function refreshBushes()
+	local folder = getNodesFolder()
+	if not folder then
+		bushes = {}
+		return false
+	end
+	if folder ~= bFolder then
+		bFolder = folder
+		bDirty = true
+		folder.ChildAdded:Connect(function() bDirty = true end)
+		folder.ChildRemoved:Connect(function() bDirty = true end)
+	end
+	if bDirty then
+		bDirty = false
+		local list = {}
+		for _, node in ipairs(folder:GetChildren()) do
+			local hb = node:FindFirstChild("HB")
+			if hb and bIsTarget(node) then
+				list[#list + 1] = { node = node, hb = hb }
+			end
+		end
+		bushes = list
+		local grid, cs = {}, BCFG.HarvestRange
+		for _, b in ipairs(list) do
+			local p = b.hb.Position
+			local key = math.floor(p.X / cs) .. "," .. math.floor(p.Z / cs)
+			local cell = grid[key]
+			if not cell then
+				cell = {}
+				grid[key] = cell
+			end
+			cell[#cell + 1] = b
+		end
+		bGrid = grid
+		print(("[AboveFarm] bushes cached: %d"):format(#list))
+		if list[1] and not printedFirstBush then
+			printedFirstBush = true
+			describeBush("sample bush", list[1].node)
+		end
+	end
+	return true
 end
 
---==================================================
--- ACTIONS
---==================================================
-local function shootMob(model, isBoss)
-    local mobRoot = model:FindFirstChild("HumanoidRootPart")
-    if not mobRoot then return end
-    
-    equipTool(CFG.WeaponName)
-    
-    local hover = isBoss and CFG.BossHoverHeight or CFG.MobHoverHeight
-    local targetPos = mobRoot.Position + Vector3.new(0, hover, 0)
-    bodyPos.Position = targetPos
-    
-    local hum, root = getChar()
-    local lastShoot = 0
-    
-    while state.AutoFarm and isAlive(model) and (mobRoot.Position - root.Position).Magnitude <= CFG.ShootRange + 5 do
-        if os.clock() - lockTime > CFG.MobTimeout then
-            break -- Timeout, find a new mob
-        end
-        
-        if os.clock() - lastShoot >= CFG.ShootDelay then
-            lastShoot = os.clock()
-            local dir = (mobRoot.Position - root.Position).Unit
-            pcall(function() 
-                if CFG.WeaponType == "Sword" then
-                    RS.Remotes.RequestSwing:FireServer(mobRoot)
-                else
-                    RS.Remotes.RequestShoot:FireServer(mobRoot.Position, dir, 1, shotCounter) 
-                end
-            end)
-            shotCounter += 1
-        end
-        RunService.Heartbeat:Wait()
-    end
+-- Berries left on a bush. After the update "Berries" is ONE mesh (ready or not); it used to be a model of 12 parts.
+-- Both layouts are handled.
+local function berryCount(node)
+	local berries = node:FindFirstChild("Berries")
+	if not berries then return 0 end
+	if berries:IsA("BasePart") then
+		return berries.Transparency < 0.95 and 1 or 0
+	end
+	local n = 0
+	for _, p in ipairs(berries:GetChildren()) do
+		if p:IsA("BasePart") and p.Transparency < 0.95 then
+			n += 1
+		end
+	end
+	return n
 end
 
-local function mineResource(hb, isTree)
-    equipTool(isTree and "Axe" or "Pickaxe")
-    local hover = isTree and CFG.TreeHoverHeight or CFG.OreHoverHeight
-    local targetPos = hb.Position + Vector3.new(0, hover, 0)
-    bodyPos.Position = targetPos
-    
-    local hum, root = getChar()
-    
-    while state.AutoFarm and hb.Parent and (root.Position - hb.Position).Magnitude <= 15 do
-        if os.clock() - lockTime > CFG.MobTimeout then break end
-        
-        for i = 1, CFG.BurstAmount do
-            if not hb.Parent then break end
-            pcall(function() RS.Remotes.RequestSwing:FireServer(hb) end)
-            task.wait(CFG.BurstDelay)
-        end
-        task.wait(0.2)
-    end
+-- a fingerprint of the berries' look, so a change counts as progress even if it isn't a transparency change
+local function berrySig(node)
+	local b = node:FindFirstChild("Berries")
+	if not b then return "none" end
+	if b:IsA("BasePart") then
+		return ("%s|%s|%s"):format(tostring(b.Transparency), tostring(b.Size), tostring(b.Color))
+	end
+	return tostring(#b:GetChildren())
 end
 
---==================================================
--- MAIN LOOP
---==================================================
-local function farmLoop()
-    while state.AutoFarm do
-        local hum, root = getChar()
-        if not hum then 
-            stopGlidePhysics()
-            task.wait(1) 
-        else
-            startGlidePhysics(hum, root)
-            
-            -- 1. Check if current locked target is dead or missing
-            if lockedTarget then
-                if not isAlive(lockedTarget) or (os.clock() - lockTime > CFG.MobTimeout) then
-                    lockedTarget = nil
-                end
-            end
-            
-            -- 2. If no target locked, find a new one
-            if not lockedTarget then
-                local targetMob, isBoss = findNearestMob(root)
-                if targetMob then
-                    lockedTarget = targetMob
-                    lockedIsMob = true
-                    lockTime = os.clock()
-                else
-                    local targetRes, isTree = findNearestResource(root)
-                    if targetRes then
-                        lockedTarget = targetRes
-                        lockedIsMob = false
-                        lockTime = os.clock()
-                    end
-                end
-            end
-            
-            -- 3. Execute action on locked target
-            if lockedTarget then
-                if lockedIsMob then
-                    local isBoss = bossNames[lockedTarget.Name] or false
-                    shootMob(lockedTarget, isBoss)
-                else
-                    local isTree = (lockedTarget.Parent and (lockedTarget.Parent.Name:find("Pine") or lockedTarget.Parent.Name:find("Tree"))) or false
-                    mineResource(lockedTarget, isTree)
-                end
-            else
-                task.wait(0.5)
-            end
-        end
-    end
-    stopGlidePhysics()
+
+local function bOnCooldown(hb)
+	local t = bCooldowns[hb]
+	return t and (os.clock() - t) < BCFG.BadBushCooldown
 end
 
---==================================================
+local function findNearestBush(pos)
+	local best, bestDist = nil, math.huge
+	for _, b in ipairs(bushes) do
+		local hb = b.hb
+		if hb.Parent then
+			local d = (hb.Position - pos).Magnitude
+			if d < bestDist and not bOnCooldown(hb) and not nearPortal(hb.Position)
+				and berryCount(b.node) > 0 then
+				best, bestDist = b, d
+			end
+		end
+	end
+	return best
+end
+
+-- visit every cached bush in the grid cells around pos
+local function forEachNear(pos, radius, fn)
+	local cs = BCFG.HarvestRange
+	for cx = math.floor((pos.X - radius) / cs), math.floor((pos.X + radius) / cs) do
+		for cz = math.floor((pos.Z - radius) / cs), math.floor((pos.Z + radius) / cs) do
+			local cell = bGrid[cx .. "," .. cz]
+			if cell then
+				for _, b in ipairs(cell) do
+					fn(b)
+				end
+			end
+		end
+	end
+end
+
+-- Pick the next stop: the bush position that has the most ready bushes within harvest range,
+-- minus a small penalty for distance. Falls back to the nearest ready bush.
+local function chooseStop(pos)
+	local memo = {}
+	local function usable(b)
+		local hb = b.hb
+		if not hb.Parent or bOnCooldown(hb) or nearPortal(hb.Position) then
+			return false
+		end
+		local v = memo[b]
+		if v == nil then
+			v = berryCount(b.node) > 0
+			memo[b] = v
+		end
+		return v
+	end
+
+	local best, bestScore = nil, -math.huge
+	forEachNear(pos, BCFG.SearchRadius, function(b)
+		if not usable(b) then return end
+		local center = b.hb.Position
+		local d = (center - pos).Magnitude
+		if d > BCFG.SearchRadius then return end
+
+		local count = 0
+		forEachNear(center, BCFG.HarvestRange, function(n)
+			if (n.hb.Position - center).Magnitude <= BCFG.HarvestRange and usable(n) then
+				count += 1
+			end
+		end)
+
+		local score = count * 10 - d * BCFG.DistanceWeight
+		if score > bestScore then
+			best, bestScore = b, score
+		end
+	end)
+
+	return best or findNearestBush(pos)
+end
+
+-- ----- movement -----
+local function glideAbove(hb)
+	local _, hum, root = getChar()
+	if not hum then return false end
+
+	local start = os.clock()
+	local hover = Vector3.new(0, BCFG.HoverHeight, 0)
+	hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false) -- no falling pose while hovering
+
+	while state.AutoBerry and hb.Parent and hum.Health > 0 do
+		if (hb.Position + hover - root.Position).Magnitude <= BCFG.StopTolerance then
+			hum:Move(Vector3.zero, false)
+			return true
+		end
+		if os.clock() - start > BCFG.GlideTimeout then
+			break
+		end
+
+		local dt = RunService.Heartbeat:Wait()
+		local goal = bAimPoint(root.Position, hb.Position + hover)
+		local offset = goal - root.Position
+		if offset.Magnitude > 0.05 then
+			root.CFrame = root.CFrame + offset.Unit * math.min(BCFG.GlideSpeed * dt, offset.Magnitude)
+		end
+		root.AssemblyLinearVelocity = Vector3.zero
+
+		local flat = Vector3.new(offset.X, 0, offset.Z)
+		hum:Move(flat.Magnitude > 1 and flat.Unit or Vector3.zero, false)
+		if hum:GetState() == Enum.HumanoidStateType.Freefall then
+			hum:ChangeState(Enum.HumanoidStateType.Running)
+		end
+	end
+
+	hum:Move(Vector3.zero, false)
+	-- ran out of time: still harvest if we ended up in range
+	return hb.Parent ~= nil and (hb.Position - root.Position).Magnitude <= BCFG.HarvestRange
+end
+
+local function walkToBush(hb)
+	local _, hum, root = getChar()
+	if not hum then return false end
+	if CFG.WalkSpeed then
+		hum.WalkSpeed = CFG.WalkSpeed
+	end
+
+	local start = os.clock()
+	local lastPos, lastCheck = root.Position, os.clock()
+
+	while state.AutoBerry and hb.Parent and hum.Health > 0 do
+		local flatDist = (bFlat(hb.Position) - bFlat(root.Position)).Magnitude
+		if flatDist <= BCFG.StopTolerance then
+			return true
+		end
+		if os.clock() - start > BCFG.WalkTimeout then
+			return flatDist <= BCFG.HarvestRange
+		end
+
+		hum:MoveTo(bAimPoint(root.Position, hb.Position))
+
+		if os.clock() - lastCheck > 0.4 then
+			if (root.Position - lastPos).Magnitude < 1 then
+				hum.Jump = true
+			end
+			lastPos, lastCheck = root.Position, os.clock()
+		end
+
+		task.wait()
+	end
+	return false
+end
+
+-- ----- harvesting -----
+local function harvestAround(root, hum)
+	local list = {}
+	for _, b in ipairs(bushes) do
+		local hb = b.hb
+		if hb.Parent and (hb.Position - root.Position).Magnitude <= BCFG.HarvestRange
+			and not bOnCooldown(hb) and not nearPortal(hb.Position) then
+			local c = berryCount(b.node)
+			if c > 0 then
+				list[#list + 1] = { b = b, last = c, sig = berrySig(b.node), progressAt = os.clock(), firedAt = 0 }
+			end
+		end
+	end
+
+	-- while hovering, freeze in place so gravity doesn't pull us down between bursts
+	local hold
+	if BCFG.Hover then
+		local holdCF = root.CFrame
+		hold = RunService.Heartbeat:Connect(function()
+			root.CFrame = holdCF
+			root.AssemblyLinearVelocity = Vector3.zero
+			if hum:GetState() == Enum.HumanoidStateType.Freefall then
+				hum:ChangeState(Enum.HumanoidStateType.Running)
+			end
+		end)
+	end
+
+	local idx, nextCheck = 1, 0
+
+	while state.AutoBerry and #list > 0 do
+		local now = os.clock()
+
+		if now >= nextCheck then
+			nextCheck = now + 0.25
+			for i = #list, 1, -1 do
+				local c = list[i]
+				local n = c.b.hb.Parent and berryCount(c.b.node) or 0
+				if n <= 0 then
+					if not printedFirstHarvest and c.b.hb.Parent then
+						printedFirstHarvest = true
+						describeBush("first harvested bush", c.b.node)
+					end
+					table.remove(list, i)
+				else
+					if n < c.last then
+						c.progressAt = now
+					end
+					local sig = berrySig(c.b.node)
+					if sig ~= c.sig then
+						c.sig = sig
+						c.progressAt = now
+					end
+					c.last = n
+					if now - c.progressAt > BCFG.StallTime then
+						bCooldowns[c.b.hb] = now
+						table.remove(list, i)
+					end
+				end
+			end
+		end
+
+		local fired = 0
+		for _ = 1, #list do
+			if fired >= BCFG.BurstSize then break end
+			if idx > #list then idx = 1 end
+			local c = list[idx]
+			idx += 1
+			if now - c.firedAt >= BCFG.RefireDelay then
+				HarvestRemote:FireServer(c.b.hb)
+				c.firedAt = now
+				fired += 1
+			end
+		end
+
+		task.wait(fired > 0 and BCFG.BurstDelay or 0.03)
+	end
+
+	if hold then hold:Disconnect() end
+end
+
+local function berryStep()
+	local _, hum, root = getChar()
+	if not hum then task.wait(1) return end
+	if not refreshBushes() then task.wait(1) return end
+
+	local target
+	if BCFG.Routing == "Cluster" then
+		target = chooseStop(root.Position)
+	else
+		target = findNearestBush(root.Position)
+	end
+	if not target then task.wait(0.5) return end
+
+	local arrived
+	if BCFG.Hover then
+		arrived = glideAbove(target.hb)
+	else
+		arrived = walkToBush(target.hb)
+	end
+
+	if arrived then
+		harvestAround(root, hum)
+		if target.node.Parent and berryCount(target.node) > 0 then
+			bCooldowns[target.hb] = os.clock() -- still has berries, don't loop on it
+		end
+	else
+		bCooldowns[target.hb] = os.clock() -- couldn't reach it, try another
+	end
+end
+
+local berryRunning = false
+
+local function startBerry()
+	if berryRunning then return end
+	berryRunning = true
+	loadPortals()
+	task.spawn(function()
+		while state.AutoBerry do
+			local ok, err = pcall(berryStep)
+			if not ok then
+				warn("[AboveFarm] error: " .. tostring(err))
+				task.wait(1)
+			end
+			task.wait()
+		end
+		berryRunning = false
+	end)
+end
+
+local function stopBerry()
+	local _, hum = getChar()
+	if hum then
+		hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+		hum:Move(Vector3.zero, false)
+	end
+end
+
+-- =====================================================================
+-- SETTINGS: anti AFK, anti lag, FOV
+-- =====================================================================
+local Lighting = game:GetService("Lighting")
+local VirtualUser = game:GetService("VirtualUser")
+
+state.AntiAFK = true
+state.AntiLag = false
+
+player.Idled:Connect(function()
+	if state.AntiAFK then
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.new())
+	end
+end)
+
+local lagBackup
+local function setAntiLag(on)
+	if on then
+		if lagBackup then return end
+		lagBackup = { fx = {}, particles = {} }
+		pcall(function()
+			lagBackup.shadows = Lighting.GlobalShadows
+			Lighting.GlobalShadows = false
+		end)
+		pcall(function()
+			lagBackup.quality = settings().Rendering.QualityLevel
+			settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+		end)
+		pcall(function()
+			lagBackup.decoration = workspace.Terrain.Decoration
+			workspace.Terrain.Decoration = false
+		end)
+		for _, v in ipairs(Lighting:GetChildren()) do
+			if v:IsA("PostEffect") then
+				table.insert(lagBackup.fx, { v, v.Enabled })
+				v.Enabled = false
+			end
+		end
+		for _, v in ipairs(workspace:GetDescendants()) do
+			if v:IsA("ParticleEmitter") or v:IsA("Trail") or v:IsA("Smoke")
+				or v:IsA("Fire") or v:IsA("Sparkles") then
+				table.insert(lagBackup.particles, { v, v.Enabled })
+				v.Enabled = false
+			end
+		end
+	elseif lagBackup then
+		local b = lagBackup
+		lagBackup = nil
+		pcall(function() Lighting.GlobalShadows = b.shadows end)
+		pcall(function() settings().Rendering.QualityLevel = b.quality end)
+		pcall(function() workspace.Terrain.Decoration = b.decoration end)
+		for _, e in ipairs(b.fx) do
+			pcall(function() e[1].Enabled = e[2] end)
+		end
+		for _, e in ipairs(b.particles) do
+			pcall(function() e[1].Enabled = e[2] end)
+		end
+	end
+end
+
+-- =====================================================================
 -- UI
---==================================================
-Tab:CreateToggle({
-    name = "Noclip",
-    flag = "Noclip",
-    currentValue = false,
-    callback = function(on)
-        toggleNoclip(on)
-    end,
+-- =====================================================================
+-- Slider syntax is a guess based on the toggle keys; each slider is wrapped so a wrong guess can't break the script
+local function addSlider(tab, opts)
+	local ok, err = pcall(function()
+		tab:CreateSlider(opts)
+	end)
+	if not ok then
+		warn("[Vanta] slider '" .. tostring(opts.name) .. "' failed: " .. tostring(err))
+	end
+end
+
+local farm = window:CreateTab({ name = "Berries" })
+
+farm:CreateToggle({
+	name = "Auto Berry",
+	flag = "AutoBerry",
+	currentValue = false,
+	callback = function(on)
+		state.AutoBerry = on
+		if on then
+			startBerry()
+		else
+			stopBerry()
+		end
+	end,
 })
 
-Tab:CreateToggle({
-    name = "Auto Farm",
-    flag = "AutoFarm",
-    currentValue = false,
-    callback = function(on)
-        state.AutoFarm = on
-        if on then 
-            task.spawn(farmLoop) 
-        else 
-            lockedTarget = nil
-            stopGlidePhysics() 
-        end
-    end,
+farm:CreateToggle({
+	name = "Hover Above Bushes",
+	flag = "BerryHover",
+	currentValue = false,
+	callback = function(on)
+		BCFG.Hover = on
+	end,
 })
 
-Tab:CreateDropdown({
-    name = "Weapon Type (Mobs)",
-    options = {"Scepter", "Bow", "Sword"},
-    currentOption = {"Scepter"},
-    multipleOptions = false,
-    callback = function(option)
-        CFG.WeaponType = option[1]
-        applyWeaponStats()
-    end,
+-- =====================================================================
+-- AUTO CRAFT (simple: pick an item, turn it on)
+-- =====================================================================
+-- Remotes seen in Cobalt:
+--   RequestCraft:FireServer("12,0,40", "Gear", 1)   -> bench key, recipe id, amount
+--   RequestLoadFuel:FireServer("12,0,40", 1)        -> bench key, amount
+-- The server also announces every bench: MachineUpdate("12,0,40", "Fabricator", _, _, _, craftsLeft)
+--
+-- Auto Craft sends the chosen item to EVERY bench that can make it, and tops up coal on
+-- benches that are nearly out of crafts (set Fuel Top-up to 0 to turn that off).
+
+local KEY_PATTERN = "^%-?%d+,%-?%d+,%-?%d+$"
+
+local CRAFT = {
+	Item = "Gear",     -- recipe id (changed with the Choose Item window)
+	Stations = nil,    -- bench types that can craft it (nil = try every bench)
+	Amount = 1,        -- per craft request (game limit: 1 to 10)
+	MaxAmount = 10,
+	Delay = 0.5,       -- seconds between requests
+	Fuel = 5,          -- coal loaded when a bench runs low (0 = never fuel); game limit 50
+	FuelLow = 10,      -- "low" = fewer than this many crafts left
+}
+
+state.AutoCraft = false
+
+local CraftRemote = Remotes:WaitForChild("RequestCraft")
+local FuelRemote = Remotes:WaitForChild("RequestLoadFuel")
+
+-- ----- recipes (read from the game's own RecipeConfig) -----
+local RC
+pcall(function()
+	RC = require(RS:WaitForChild("Shared", 5):WaitForChild("Config", 5):WaitForChild("RecipeConfig", 5))
+end)
+if type(RC) ~= "table" then
+	RC = nil
+	warn("[AboveFarm] couldn't read RecipeConfig, so the item list is empty")
+end
+
+local RECIPE_GROUPS = {
+	"Tools", "Weapons", "Blocks", "Structural", "Machines", "Harvesters",
+	"Converters", "Lighting", "Torches", "Food", "Utility", "Dyed", "Families",
+}
+
+local STATION_DISPLAY = {
+	Workbench = "Workbench",
+	Fabricator = "Machinery Workbench",
+	BuilderBench = "Builder Bench",
+	BlockPress = "Industrial Block Press",
+	IndustrialFurnace = "Industrial Furnace",
+	Furnace = "Furnace",
+	CookingStation = "Cooking Station",
+	LightingBench = "Lighting Bench",
+}
+local STATION_ORDER = {
+	"Workbench", "Fabricator", "BuilderBench", "CookingStation", "LightingBench",
+	"BlockPress", "IndustrialFurnace", "Furnace",
+}
+
+local function rankIn(list, value)
+	for i, v in ipairs(list) do
+		if v == value then return i end
+	end
+	return 100
+end
+
+-- bench types listed on a recipe (handles "stations" as a list or a single string)
+local function stationsOf(r)
+	local out = {}
+	local s = r.stations or r.station or r.Station
+	if type(s) == "table" then
+		for _, v in ipairs(s) do
+			if type(v) == "string" then out[#out + 1] = v end
+		end
+	elseif type(s) == "string" then
+		out[1] = s
+	end
+	return out
+end
+
+local recipes = {}         -- id -> recipe table
+local categoryOf = {}      -- id -> category
+local recipeStations = {}  -- every bench type any recipe mentions
+
+if RC then
+	-- a recipe is any string-keyed table entry that has inputs or an output
+	local function collect(name, t, category)
+		if type(t) ~= "table" then return end
+		for id, r in pairs(t) do
+			if type(id) == "string" and type(r) == "table" and (r.inputs ~= nil or r.output ~= nil) then
+				recipes[id] = recipes[id] or r
+				categoryOf[id] = categoryOf[id] or category
+			end
+		end
+	end
+
+	for _, group in ipairs(RECIPE_GROUPS) do
+		collect(group, RC[group], group)
+	end
+	for name, t in pairs(RC) do -- any other table that holds recipes
+		if type(name) == "string" and name ~= "All" then
+			collect(name, t, "Other")
+		end
+	end
+	collect("All", RC.All, "Other")
+
+	for _, r in pairs(recipes) do
+		for _, st in ipairs(stationsOf(r)) do
+			recipeStations[st] = true
+		end
+	end
+end
+
+-- ----- what the server tells us -----
+local benchTypes = {}   -- ["x,y,z"] = bench type (from MachineUpdate)
+local craftsLeft = {}   -- ["x,y,z"] = crafts left on that bench (from MachineUpdate)
+
+local MachineUpdate = Remotes:FindFirstChild("MachineUpdate")
+if MachineUpdate then
+	MachineUpdate.OnClientEvent:Connect(function(key, machineType, _, _, _, crafts)
+		if type(key) == "string" and key:match(KEY_PATTERN) then
+			if type(machineType) == "string" then benchTypes[key] = machineType end
+			if type(crafts) == "number" then craftsLeft[key] = crafts end
+		end
+	end)
+end
+
+-- ----- finding benches -----
+local function keyFromInstance(inst)
+	local k = inst:GetAttribute("CellKey")
+	if type(k) == "string" and k:match(KEY_PATTERN) then return k end
+	if inst.Name:match(KEY_PATTERN) then return inst.Name end
+	for _, v in pairs(inst:GetAttributes()) do
+		if type(v) == "string" and v:match(KEY_PATTERN) then return v end
+	end
+	for _, c in ipairs(inst:GetChildren()) do
+		if c:IsA("StringValue") and c.Value:match(KEY_PATTERN) then return c.Value end
+	end
+end
+
+-- walk up until something carries the bench's key; also return its BlockId as a type hint
+local function keyFor(inst, stopAt)
+	while inst and inst ~= stopAt and inst ~= workspace do
+		local k = keyFromInstance(inst)
+		if k then
+			local t = inst:GetAttribute("BlockId")
+			return k, type(t) == "string" and t or nil
+		end
+		inst = inst.Parent
+	end
+end
+
+-- the on-screen name of a bench ("Machinery Workbench  ·  45 coal  ·  182 crafts") -> its bench type
+local function classifyPrompt(text)
+	local t = (text or ""):lower()
+	t = t:match("^(.-)%s*·") or t
+	local candidates
+	if t:find("machinery", 1, true) then candidates = { "Fabricator" }
+	elseif t:find("builder", 1, true) then candidates = { "BuilderBench" }
+	elseif t:find("lighting", 1, true) then candidates = { "LightingBench", "Lighting" }
+	elseif t:find("block press", 1, true) then candidates = { "BlockPress" }
+	elseif t:find("furnace", 1, true) then candidates = { "IndustrialFurnace", "Furnace" }
+	elseif t:find("cooking", 1, true) then candidates = { "CookingStation", "Cooker" }
+	elseif t:find("workbench", 1, true) then candidates = { "Workbench" }
+	end
+	if not candidates then return nil end
+	for _, c in ipairs(candidates) do
+		if recipeStations[c] then return c end -- only ids the recipes really use
+	end
+	return nil
+end
+
+local benches, lastScan = {}, 0
+
+local function scanBenches(force)
+	if not force and os.clock() - lastScan < 20 then return end
+	lastScan = os.clock()
+
+	local nodes = getNodesFolder()
+	local island = nodes and nodes.Parent
+	local blocks = island and island:FindFirstChild("Blocks")
+	if not blocks then return end
+
+	local byKey, list = {}, {}
+	local function add(key, btype)
+		local e = byKey[key]
+		if not e then
+			e = { key = key }
+			byKey[key] = e
+			list[#list + 1] = e
+		end
+		e.type = e.type or btype
+	end
+
+	-- top-level blocks whose BlockId is a bench type
+	for _, b in ipairs(blocks:GetChildren()) do
+		local id, key = b:GetAttribute("BlockId"), b:GetAttribute("CellKey")
+		if type(id) == "string" and type(key) == "string" and recipeStations[id] and key:match(KEY_PATTERN) then
+			add(key, id)
+		end
+	end
+
+	-- every bench has a prompt ("Craft | Workbench", "Fabricate | Machinery Workbench", ...) or a Workbench part
+	for _, inst in ipairs(blocks:GetDescendants()) do
+		if inst:IsA("ProximityPrompt") then
+			local btype = classifyPrompt(inst.ObjectText)
+			if btype then
+				local key = keyFor(inst, blocks)
+				if key then add(key, btype) end
+			end
+		elseif inst.Name == "Workbench" then
+			local key, btype = keyFor(inst, blocks)
+			if key then add(key, btype) end
+		end
+	end
+
+	benches = list
+end
+
+-- every bench we know of, with its type (the server's answer wins)
+local function allBenches()
+	scanBenches(false)
+	local byKey, out = {}, {}
+	for _, b in ipairs(benches) do
+		byKey[b.key] = { key = b.key, type = b.type }
+		out[#out + 1] = byKey[b.key]
+	end
+	for key, btype in pairs(benchTypes) do
+		local e = byKey[key]
+		if not e then
+			e = { key = key }
+			byKey[key] = e
+			out[#out + 1] = e
+		end
+		e.type = btype
+	end
+	return out
+end
+
+-- benches that can craft the chosen item (benches of unknown type are always included)
+local function craftTargets()
+	local allowed
+	if CRAFT.Stations then
+		allowed = {}
+		for _, st in ipairs(CRAFT.Stations) do allowed[st] = true end
+	end
+	local out = {}
+	for _, e in ipairs(allBenches()) do
+		if not allowed or not e.type or allowed[e.type] then
+			out[#out + 1] = e
+		end
+	end
+	return out
+end
+
+-- ----- the craft loop -----
+local craftRunning = false
+local lastReport, warnedNone = "", false
+
+local function report(targets)
+	local counts = {}
+	for _, e in ipairs(targets) do
+		local t = e.type and (STATION_DISPLAY[e.type] or e.type) or "unknown type"
+		counts[t] = (counts[t] or 0) + 1
+	end
+	local parts = {}
+	for t, n in pairs(counts) do parts[#parts + 1] = ("%s x%d"):format(t, n) end
+	table.sort(parts)
+	local text = ("%s at %d benches (%s)"):format(CRAFT.Item, #targets, table.concat(parts, ", "))
+	if text ~= lastReport then
+		lastReport = text
+		print("[AboveFarm] crafting " .. text)
+	end
+end
+
+local function startCraft()
+	if craftRunning then return end
+	craftRunning = true
+	scanBenches(true)
+	task.spawn(function()
+		while state.AutoCraft do
+			local ok, err = pcall(function()
+				local targets = craftTargets()
+				if #targets == 0 then
+					if not warnedNone then
+						warnedNone = true
+						warn("[AboveFarm] no benches found yet for " .. CRAFT.Item)
+					end
+					task.wait(2)
+					return
+				end
+				warnedNone = false
+				report(targets)
+
+				local amount = math.clamp(CRAFT.Amount, 1, CRAFT.MaxAmount)
+				for _, e in ipairs(targets) do
+					if not state.AutoCraft then break end
+
+					-- top up coal when this bench is nearly out of crafts
+					local left = craftsLeft[e.key]
+					if CRAFT.Fuel > 0 and left and left < CRAFT.FuelLow then
+						FuelRemote:FireServer(e.key, math.clamp(CRAFT.Fuel, 1, 50))
+						craftsLeft[e.key] = nil -- wait for the server's next update before topping up again
+						task.wait(CRAFT.Delay)
+					end
+
+					CraftRemote:FireServer(e.key, CRAFT.Item, amount)
+					task.wait(CRAFT.Delay)
+				end
+			end)
+			if not ok then
+				warn("[AboveFarm] craft error: " .. tostring(err))
+				task.wait(1)
+			end
+			task.wait()
+		end
+		craftRunning = false
+	end)
+end
+
+-- ----- the item picker window (search + bench > item list; shows every recipe) -----
+local pickerGui
+
+local function openPicker()
+	if pickerGui then
+		pickerGui:Destroy()
+		pickerGui = nil
+	end
+
+	-- group recipes: bench (first one listed on the recipe) -> items
+	local groupsByKey, groups = {}, {}
+	for id, r in pairs(recipes) do
+		local sts = stationsOf(r)
+		local key = sts[1] or "~"
+		local g = groupsByKey[key]
+		if not g then
+			g = { key = key, name = key == "~" and "Any bench" or (STATION_DISPLAY[key] or key), items = {} }
+			groupsByKey[key] = g
+			groups[#groups + 1] = g
+		end
+		g.items[#g.items + 1] = { id = id, group = categoryOf[id] or "Other", recipe = r }
+	end
+	table.sort(groups, function(a, b)
+		local ra, rb = rankIn(STATION_ORDER, a.key), rankIn(STATION_ORDER, b.key)
+		if ra ~= rb then return ra < rb end
+		return a.name < b.name
+	end)
+	for _, g in ipairs(groups) do
+		table.sort(g.items, function(a, b)
+			local ca, cb = rankIn(RECIPE_GROUPS, a.group), rankIn(RECIPE_GROUPS, b.group)
+			if ca ~= cb then return ca < cb end
+			return a.id < b.id
+		end)
+	end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "CraftPicker"
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 999
+	pcall(function()
+		gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+	end)
+	if not gui.Parent then
+		gui.Parent = player:WaitForChild("PlayerGui")
+	end
+	pickerGui = gui
+
+	local frame = Instance.new("Frame")
+	frame.Size = UDim2.new(0.92, 0, 0.8, 0)
+	frame.Position = UDim2.new(0.04, 0, 0.1, 0)
+	frame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+	frame.BorderSizePixel = 0
+	frame.Parent = gui
+	Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, -90, 0, 30)
+	title.Position = UDim2.new(0, 10, 0, 6)
+	title.BackgroundTransparency = 1
+	title.TextColor3 = Color3.new(1, 1, 1)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 16
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Parent = frame
+
+	local closeBtn = Instance.new("TextButton")
+	closeBtn.Size = UDim2.new(0, 70, 0, 30)
+	closeBtn.Position = UDim2.new(1, -80, 0, 6)
+	closeBtn.BackgroundColor3 = Color3.fromRGB(90, 50, 50)
+	closeBtn.TextColor3 = Color3.new(1, 1, 1)
+	closeBtn.Font = Enum.Font.GothamBold
+	closeBtn.TextSize = 14
+	closeBtn.Text = "Done"
+	closeBtn.Parent = frame
+	Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 8)
+	closeBtn.MouseButton1Click:Connect(function()
+		gui:Destroy()
+		if pickerGui == gui then pickerGui = nil end
+	end)
+
+	local search = Instance.new("TextBox")
+	search.Size = UDim2.new(1, -20, 0, 34)
+	search.Position = UDim2.new(0, 10, 0, 42)
+	search.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
+	search.TextColor3 = Color3.new(1, 1, 1)
+	search.PlaceholderText = "Search items..."
+	search.Font = Enum.Font.Gotham
+	search.TextSize = 15
+	search.ClearTextOnFocus = false
+	search.Text = ""
+	search.Parent = frame
+	Instance.new("UICorner", search).CornerRadius = UDim.new(0, 8)
+
+	local list = Instance.new("ScrollingFrame")
+	list.Size = UDim2.new(1, -20, 1, -90)
+	list.Position = UDim2.new(0, 10, 0, 82)
+	list.BackgroundColor3 = Color3.fromRGB(10, 10, 12)
+	list.BorderSizePixel = 0
+	list.ScrollBarThickness = 6
+	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	list.CanvasSize = UDim2.new(0, 0, 0, 0)
+	list.Parent = frame
+	local layout = Instance.new("UIListLayout")
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Padding = UDim.new(0, 3)
+	layout.Parent = list
+
+	local function updateTitle()
+		title.Text = "Craft: " .. CRAFT.Item
+	end
+	updateTitle()
+
+	local expanded = {}
+	local render
+
+	local function makeRow(text, order, color, onClick)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(1, -6, 0, 34)
+		b.LayoutOrder = order
+		b.BackgroundColor3 = color
+		b.TextColor3 = Color3.new(1, 1, 1)
+		b.Font = Enum.Font.Gotham
+		b.TextSize = 15
+		b.TextXAlignment = Enum.TextXAlignment.Left
+		b.Text = "  " .. text
+		b.Parent = list
+		Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+		b.MouseButton1Click:Connect(onClick)
+	end
+
+	render = function()
+		for _, c in ipairs(list:GetChildren()) do
+			if c:IsA("GuiObject") then c:Destroy() end
+		end
+
+		local q = search.Text:lower()
+		local order, shown = 0, 0
+		for _, g in ipairs(groups) do
+			local matches = {}
+			for _, it in ipairs(g.items) do
+				if q == "" or it.id:lower():find(q, 1, true) or it.group:lower():find(q, 1, true) then
+					matches[#matches + 1] = it
+				end
+			end
+
+			if #matches > 0 then
+				local open = q ~= "" or expanded[g.key]
+				order += 1
+				makeRow((open and "- " or "+ ") .. g.name .. "  (" .. #matches .. ")", order, Color3.fromRGB(50, 50, 80), function()
+					expanded[g.key] = not expanded[g.key]
+					render()
+				end)
+
+				if open then
+					for _, it in ipairs(matches) do
+						if shown >= 400 then break end
+						shown += 1
+						order += 1
+						local selected = it.id == CRAFT.Item
+						makeRow(it.group .. "  ·  " .. it.id, order,
+							selected and Color3.fromRGB(40, 110, 70) or Color3.fromRGB(28, 28, 36),
+							function()
+								CRAFT.Item = it.id
+								local sts = stationsOf(it.recipe)
+								CRAFT.Stations = #sts > 0 and sts or nil
+								print(("[AboveFarm] selected %s (benches: %s)"):format(
+									it.id, #sts > 0 and table.concat(sts, ", ") or "any"))
+								updateTitle()
+								render()
+							end)
+					end
+				end
+			end
+		end
+
+		if order == 0 then
+			makeRow("nothing found", 1, Color3.fromRGB(28, 28, 36), function() end)
+		elseif shown >= 400 then
+			makeRow("... type in the search box to narrow it down", order + 1, Color3.fromRGB(28, 28, 36), function() end)
+		end
+	end
+
+	search:GetPropertyChangedSignal("Text"):Connect(render)
+	render()
+end
+
+-- ----- UI -----
+local function dual(t)
+	local out = {}
+	for k, v in pairs(t) do
+		out[k] = v
+		out[k:sub(1, 1):upper() .. k:sub(2)] = v
+	end
+	return out
+end
+
+local craftTab = window:CreateTab({ name = "Craft" })
+
+craftTab:CreateToggle({
+	name = "Auto Craft",
+	flag = "AutoCraft",
+	currentValue = false,
+	callback = function(on)
+		state.AutoCraft = on
+		if on then startCraft() end
+	end,
 })
 
-Tab:CreateToggle({ name = "Farm Mobs", flag = "T_Mob", currentValue = true, callback = function(on) state.Mob = on; lockedTarget = nil end })
-Tab:CreateToggle({ name = "Farm Boss (Morten)", flag = "T_Boss", currentValue = false, callback = function(on) state.Boss = on; lockedTarget = nil end })
-Tab:CreateToggle({ name = "Farm Ores", flag = "T_Ore", currentValue = true, callback = function(on) state.Ore = on; lockedTarget = nil end })
-Tab:CreateToggle({ name = "Farm Trees", flag = "T_Tree", currentValue = true, callback = function(on) state.Tree = on; lockedTarget = nil end })
+local okButton, errButton = pcall(function()
+	craftTab:CreateButton(dual({
+		name = "Choose Item to Craft",
+		callback = openPicker,
+	}))
+end)
+if not okButton then
+	warn("[AboveFarm] button failed (" .. tostring(errButton) .. "), opening the item picker now instead")
+	openPicker()
+end
+
+addSlider(craftTab, {
+	name = "Craft Amount",
+	flag = "CraftAmount",
+	range = { 1, CRAFT.MaxAmount },
+	increment = 1,
+	suffix = "",
+	currentValue = CRAFT.Amount,
+	callback = function(value)
+		CRAFT.Amount = math.clamp(math.floor(value), 1, CRAFT.MaxAmount)
+	end,
+})
+
+addSlider(craftTab, {
+	name = "Fuel Top-up (0 = off)",
+	flag = "CraftFuel",
+	range = { 0, 50 },
+	increment = 1,
+	suffix = " coal",
+	currentValue = CRAFT.Fuel,
+	callback = function(value)
+		CRAFT.Fuel = math.clamp(math.floor(value), 0, 50)
+	end,
+})
+
+addSlider(craftTab, {
+	name = "Delay",
+	flag = "CraftDelay",
+	range = { 0.1, 3 },
+	increment = 0.1,
+	suffix = " s",
+	currentValue = CRAFT.Delay,
+	callback = function(value)
+		CRAFT.Delay = value
+	end,
+})
+
+-- a few seconds after loading, say what we found
+task.delay(6, function()
+	local nRecipes = 0
+	for _ in pairs(recipes) do nRecipes += 1 end
+	local counts, total = {}, 0
+	for _, e in ipairs(allBenches()) do
+		local t = e.type or "unknown"
+		counts[t] = (counts[t] or 0) + 1
+		total += 1
+	end
+	local parts = {}
+	for t, n in pairs(counts) do parts[#parts + 1] = ("%s x%d"):format(t, n) end
+	table.sort(parts)
+	print(("[AboveFarm] recipes: %d | benches: %d (%s)"):format(nRecipes, total, table.concat(parts, ", ")))
+end)
+
+local settingsTab = window:CreateTab({ name = "Settings" })
+
+settingsTab:CreateToggle({
+	name = "Anti AFK",
+	flag = "AntiAFK",
+	currentValue = true,
+	callback = function(on)
+		state.AntiAFK = on
+	end,
+})
+
+settingsTab:CreateToggle({
+	name = "Anti Lag",
+	flag = "AntiLag",
+	currentValue = false,
+	callback = function(on)
+		state.AntiLag = on
+		setAntiLag(on)
+	end,
+})
+
+do
+	local _, hum = getChar()
+	addSlider(settingsTab, {
+		name = "Walk Speed",
+		flag = "WalkSpeed",
+		range = { 10, 100 },
+		increment = 1,
+		suffix = " studs/s",
+		currentValue = hum and math.floor(hum.WalkSpeed) or 16,
+		callback = function(value)
+			CFG.WalkSpeed = value -- applied while the farms are walking
+		end,
+	})
+end
+
+addSlider(settingsTab, {
+	name = "Berry Glide Speed",
+	flag = "BerryGlideSpeed",
+	range = { 10, 120 },
+	increment = 5,
+	suffix = " studs/s",
+	currentValue = BCFG.GlideSpeed,
+	callback = function(value)
+		BCFG.GlideSpeed = value
+	end,
+})
+
+addSlider(settingsTab, {
+	name = "Berry Burst Size",
+	flag = "BerryBurstSize",
+	range = { 1, 15 },
+	increment = 1,
+	suffix = "",
+	currentValue = BCFG.BurstSize,
+	callback = function(value)
+		BCFG.BurstSize = value
+	end,
+})
+
+addSlider(settingsTab, {
+	name = "Swings Per Tick",
+	flag = "SwingsPerTick",
+	range = { 1, 20 },
+	increment = 1,
+	suffix = "",
+	currentValue = CFG.SwingsPerTick,
+	callback = function(value)
+		CFG.SwingsPerTick = value
+	end,
+})
+
+addSlider(settingsTab, {
+	name = "Field of View",
+	flag = "FOV",
+	range = { 40, 120 },
+	increment = 1,
+	suffix = "°",
+	currentValue = workspace.CurrentCamera and math.floor(workspace.CurrentCamera.FieldOfView) or 70,
+	callback = function(value)
+		if workspace.CurrentCamera then
+			workspace.CurrentCamera.FieldOfView = value
+		end
+	end,
+})
