@@ -1,4 +1,4 @@
--- autobuilder_v10.1.0 (Hollow Ring + Stone Statue)
+-- autocastle_v12.0.0 (Perfect 60x60 Castle)
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -16,31 +16,27 @@ local function dual(t)
 end
 
 local Window = Rayfield:CreateWindow(dual({
-	name = "VANTA | Mega Shop & Statue",
+	name = "VANTA | Castle Builder",
 	loadingTitle = "VANTA",
-	loadingSubtitle = "Skyblock Flex",
+	loadingSubtitle = "60x60 Shop Base",
 }))
 local Tab = Window:CreateTab(dual({ name = "Builder" }))
 
 local CFG = {
-	PlaceDelay = 0.08,
+	PlaceDelay = 0.05,
 	MaxDelay = 1.0,
 	CheckTimeout = 3,
 	MaxRetries = 4,
 	GlideSpeed = 35,
 	HoverHeight = 4,
 	
-	-- SHOP SETTINGS
-	Radius = 60,          -- 120x120 diameter
-	WallHeight = 15,      -- Height of the outer ring walls
-	FloorThickness = 6,   -- Width of the shop walkway
-	FloorBlock = "StoneBrick",
+	-- CASTLE SETTINGS
+	Radius = 30,          -- 30 = 60x60 castle size
+	WallHeight = 15,      -- How tall the main walls are
+	TowerHeight = 25,     -- How tall the corner towers are
 	WallBlock = "StoneBrick",
-	
-	-- STATUE SETTINGS
-	BuildStatue = true,
-	StatueBlockOuter = "StoneBrick", -- Outer layer (Armor)
-	StatueBlockInner = "StoneBlock", -- Inner layer (Flesh/Base)
+	TowerBlock = "StoneBrick",
+	FloorBlock = "StoneBlock",
 }
 
 local FIXED_NORMAL = Vector3.new(-1, 0, 0)
@@ -63,84 +59,70 @@ local function notify(title, content)
 end
 
 -- ==================================================
--- HOLLOW CIRCULAR BLUEPRINT + STATUE
+-- PERFECT CASTLE BLUEPRINT
 -- ==================================================
 local function terrainBlueprint(sx, sy, sz)
 	local cells = {}
-	local radius = CFG.Radius
-	local height = CFG.WallHeight
-	local thickness = CFG.FloorThickness
+	local r = CFG.Radius
+	local wallH = CFG.WallHeight
+	local towerH = CFG.TowerHeight
 
-	-- 1. Build the Ring
-	for x = -radius, radius do
-		for z = -radius, radius do
-			local dist = math.sqrt(x*x + z*z)
+	-- Helper function to add a solid block
+	local function addBlock(x, y, z, blockType)
+		local wx, wy, wz = sx + x, sy + y, sz + z
+		cells[fmt(wx, wy, wz)] = {wx, wy, wz, blockType}
+	end
+
+	-- 1. Build the Perimeter Walls & Floor
+	for x = -r, r do
+		for z = -r, r do
+			local isWall = math.abs(x) == r or math.abs(z) == r
 			
-			if dist <= radius then
-				local wx = sx + x
-				local wz = sz + z
+			-- Build the floor
+			addBlock(x, 0, z, CFG.FloorBlock)
+			
+			-- Build the walls
+			if isWall then
+				-- Leave a 6-block wide gap for the main gate (Front Wall, around X=0)
+				local isGate = (z == -r) and (math.abs(x) <= 3)
 				
-				-- Floor Ring
-				if dist > (radius - thickness) then
-					cells[fmt(wx, sy, wz)] = {wx, sy, wz, CFG.FloorBlock}
-				end
-				
-				-- Outer Wall
-				if dist > (radius - 2) then
-					for wy = sy + 1, sy + height do
-						cells[fmt(wx, wy, wz)] = {wx, wy, wz, CFG.WallBlock}
+				if not isGate then
+					for y = 1, wallH do
+						addBlock(x, y, z, CFG.WallBlock)
+					end
+					-- Crenellations (Battlements) on the main wall
+					if (math.abs(x) % 2 == 0) then
+						addBlock(x, wallH + 1, z, CFG.WallBlock)
 					end
 				end
 			end
 		end
 	end
 
-	-- 2. Build a Bridge from the edge to the center
-	if CFG.BuildStatue then
-		for x = 0, radius - thickness do
-			cells[fmt(sx + x, sy, sz)] = {sx + x, sy, sz, CFG.FloorBlock}
-		end
-		
-		-- 3. Build a Giant Statue (Humanoid holding a sword)
-		local outer = CFG.StatueBlockOuter
-		local inner = CFG.StatueBlockInner
-		
-		local function addBox(cx, cy, cz, w, h, d, isOuterOnly)
-			for x = math.floor(cx - w/2), math.ceil(cx + w/2) do
-				for z = math.floor(cz - d/2), math.ceil(cz + d/2) do
-					local isEdge = (x == math.floor(cx - w/2) or x == math.ceil(cx + w/2) or z == math.floor(cz - d/2) or z == math.ceil(cz + d/2))
-					if isEdge or not isOuterOnly then
-						for y = cy, cy + h - 1 do
-							local wx = sx + x
-							local wz = sz + z
-							-- Use StoneBrick for the edges (armor) and StoneBlock for the inside
-							local blockType = isEdge and outer or inner
-							cells[fmt(wx, y, wz)] = {wx, y, wz, blockType}
-						end
+	-- 2. Build the 4 Corner Towers
+	local towerSpots = {
+		{r, r}, {-r, r},
+		{r, -r}, {-r, -r}
+	}
+
+	for _, spot in ipairs(towerSpots) do
+		local tx, tz = spot[1], spot[2]
+		-- Towers are 8x8 blocks
+		for x = -4, 4 do
+			for z = -4, 4 do
+				-- Only build the outer shell of the tower
+				if math.abs(x) == 4 or math.abs(z) == 4 then
+					for y = 1, towerH do
+						addBlock(tx + x, y, tz + z, CFG.TowerBlock)
+					end
+					
+					-- Tower roof/cap
+					if y == towerH then
+						addBlock(tx + x, towerH + 1, tz + z, CFG.TowerBlock)
 					end
 				end
 			end
 		end
-
-		local baseY = sy + 1
-		
-		-- Legs (StoneBlock)
-		addBox(0, baseY, -4, 6, 12, 6, false)
-		addBox(0, baseY, 4, 6, 12, 6, false)
-		
-		-- Torso (StoneBrick shell, StoneBlock inside)
-		addBox(0, baseY + 12, 0, 14, 16, 10, true)
-		
-		-- Head (StoneBrick)
-		addBox(0, baseY + 28, 0, 8, 8, 8, false)
-		
-		-- Sword Arm
-		addBox(8, baseY + 18, 0, 16, 5, 5, false)
-		addBox(16, baseY + 10, 0, 5, 20, 5, false) -- Sword blade
-		
-		-- Shield Arm
-		addBox(-8, baseY + 16, 0, 8, 5, 5, false)
-		addBox(-12, baseY + 10, 0, 3, 15, 10, false) -- Shield
 	end
 
 	return cells
@@ -283,7 +265,7 @@ local function build(seedKey, run)
 		materials[#materials + 1] = ("%dx %s"):format(n, id)
 	end
 	table.sort(materials)
-	notify("Building Mega Shop", ("%d blocks: %s"):format(total, table.concat(materials, ", ")))
+	notify("Building the Castle", ("%d blocks: %s"):format(total, table.concat(materials, ", ")))
 
 	local frontierByY = {}
 	local function addFrontier(key, c)
@@ -446,7 +428,7 @@ end
 
 -- ===== UI =====
 Tab:CreateToggle(dual({
-	name = "Auto Builder",
+	name = "Build 60x60 Castle",
 	flag = "AutoBuilder",
 	currentValue = false,
 	callback = function(on)
@@ -464,37 +446,20 @@ Tab:CreateToggle(dual({
 		local run = RunId
 		table.insert(conns, BlocksFolder.ChildAdded:Connect(function(block) onBlockAdded(block, run) end))
 		table.insert(conns, BlocksFolder.ChildRemoved:Connect(unregister))
-		notify("Builder on", "Place a block at the CENTER of the ring.")
+		notify("Castle Builder on", "Place a block at the CENTER.")
 	end,
 }))
 
 pcall(function()
-	Tab:CreateToggle(dual({
-		name = "Build Middle Statue",
-		flag = "BuildStatue",
-		currentValue = CFG.BuildStatue,
-		callback = function(on) CFG.BuildStatue = on end,
-	}))
-
 	Tab:CreateSlider(dual({
-		name = "Radius",
-		flag = "Radius",
-		range = { 30, 75 },
-		increment = 1,
-		suffix = " studs",
-		currentValue = CFG.Radius,
-		callback = function(v) CFG.Radius = v end,
-	}))
-	
-	Tab:CreateSlider(dual({
-		name = "Wall Height",
-		flag = "WallHeight",
-		range = { 5, 30 },
-		increment = 1,
-		suffix = " blocks",
-		currentValue = CFG.WallHeight,
-		callback = function(v) CFG.WallHeight = v end,
+		name = "Place Delay",
+		flag = "BuilderDelay",
+		range = { 0.03, 1 },
+		increment = 0.01,
+		suffix = " s",
+		currentValue = CFG.PlaceDelay,
+		callback = function(v) CFG.PlaceDelay = v end,
 	}))
 end)
 
-notify("VANTA Mega Shop", "Loaded. Place a block at the center.")
+notify("VANTA Castle Builder", "Loaded. Place a block at the center.")
