@@ -1,4 +1,4 @@
--- autobuilder_v28.0.0 (Flawless Hollow Plateau)
+-- autobuilder_v30.0.0 (Claude's Engine + Expanding Cliffs)
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -16,30 +16,27 @@ local function dual(t)
 end
 
 local Window = Rayfield:CreateWindow(dual({
-	name = "VANTA | Hollow Plateau",
+	name = "VANTA | Expanding Mountain",
 	loadingTitle = "VANTA",
-	loadingSubtitle = "Hollow Cliff Base",
+	loadingSubtitle = "Claude Engine + Cliffs",
 }))
 local Tab = Window:CreateTab(dual({ name = "Builder" }))
 
 local CFG = {
-	PlaceDelay = 0.04,
+	PlaceDelay = 0.1,
 	MaxDelay = 1.0,
 	CheckTimeout = 3,
 	MaxRetries = 4,
-	GlideSpeed = 45,
+	GlideSpeed = 30,
 	HoverHeight = 4,
 	
-	-- EXPANDING TERRAIN SETTINGS
-	Tier1Base = 20,       
-	Tier2Base = 35,       
-	Tier3Base = 50,       
-	NoiseScale = 8,       
-	LevelHeight = 7,      
-	SkirtThickness = 3, 
-	FloorBlock = "GrassBlock",
-	CliffBlockA = "StoneBlock",
-	CliffBlockB = "StoneBrick",
+	-- TERRAIN SETTINGS
+	Tier1Base = 20,
+	Tier2Base = 35,
+	Tier3Base = 50,
+	NoiseScale = 8,
+	LevelHeight = 7,
+	SlopeWidth = 4,
 }
 
 local FIXED_NORMAL = Vector3.new(-1, 0, 0)
@@ -64,17 +61,12 @@ local function notify(title, content)
 end
 
 -- ==================================================
--- FLAWLESS HOLLOW BLUEPRINT
+-- EXPANDING CLIFF BLUEPRINT (Hollow Shell)
 -- ==================================================
 local function getRadius(baseRadius, x, z)
 	local angle = math.atan2(z, x)
 	local noise = math.noise(math.cos(angle) * 2, math.sin(angle) * 2, shapeSeed)
 	return baseRadius + (noise * CFG.NoiseScale)
-end
-
-local function getRockBlock(x, y, z)
-    local noise = math.noise(x * 0.5, y * 0.5, z * 0.5)
-    if noise > 0 then return CFG.CliffBlockA else return CFG.CliffBlockB end
 end
 
 local function terrainBlueprint(sx, sy, sz)
@@ -93,36 +85,38 @@ local function terrainBlueprint(sx, sy, sz)
 			local r2 = getRadius(CFG.Tier2Base, x, z)
 			local r3 = getRadius(CFG.Tier3Base, x, z)
 			
-			-- 1. Build Tier 1 Floor
+			-- Tier 1 Floor
 			if dist <= r1 then
-				addBlock(x, 0, z, CFG.FloorBlock)
+				addBlock(x, 0, z, "GrassBlock")
 			end
 			
-			-- 2. Build Tier 2 Skirt & Floor
+			-- Tier 2 Floor
 			if dist <= r2 then
-				-- Skirt dropping down to Tier 1
-				if dist > r1 and dist <= r1 + CFG.SkirtThickness then
-					for y = 1, CFG.LevelHeight - 1 do
-						addBlock(x, y, z, getRockBlock(x, y, z))
-					end
-				end
-				-- The Floor
-				if dist <= r2 and dist > r1 then
-					addBlock(x, CFG.LevelHeight, z, CFG.FloorBlock)
+				addBlock(x, CFG.LevelHeight, z, "GrassBlock")
+			end
+			
+			-- Tier 3 Floor
+			if dist <= r3 then
+				addBlock(x, CFG.LevelHeight * 2, z, "GrassBlock")
+			end
+			
+			-- Slope 1 (Tier 1 to Tier 2)
+			if dist > r1 and dist <= r1 + CFG.SlopeWidth then
+				local progress = (dist - r1) / CFG.SlopeWidth
+				local topY = math.floor(progress * (CFG.LevelHeight - 1))
+				for y = 1, topY do
+					local blockType = (math.random(1, 100) <= 50) and "StoneBlock" or "StoneBrick"
+					addBlock(x, y, z, blockType)
 				end
 			end
 			
-			-- 3. Build Tier 3 Skirt & Floor
-			if dist <= r3 then
-				-- Skirt dropping down to Tier 2
-				if dist > r2 and dist <= r2 + CFG.SkirtThickness then
-					for y = CFG.LevelHeight + 1, CFG.LevelHeight * 2 - 1 do
-						addBlock(x, y, z, getRockBlock(x, y, z))
-					end
-				end
-				-- The Floor
-				if dist <= r3 and dist > r2 then
-					addBlock(x, CFG.LevelHeight * 2, z, CFG.FloorBlock)
+			-- Slope 2 (Tier 2 to Tier 3)
+			if dist > r2 and dist <= r2 + CFG.SlopeWidth then
+				local progress = (dist - r2) / CFG.SlopeWidth
+				local topY = CFG.LevelHeight + math.floor(progress * (CFG.LevelHeight - 1))
+				for y = CFG.LevelHeight + 1, topY do
+					local blockType = (math.random(1, 100) <= 50) and "StoneBlock" or "StoneBrick"
+					addBlock(x, y, z, blockType)
 				end
 			end
 		end
@@ -245,7 +239,7 @@ local function glideAbove(pos, offset, run)
 	end)
 end
 
--- ===== the snake builder =====
+-- ===== Claude's Flawless Snake Builder =====
 local function build(seedKey, run)
 	local Remote = RS:WaitForChild("Remotes"):WaitForChild("RequestPlace")
 	local sx, sy, sz = seedKey:match(KEY_PATTERN)
@@ -268,7 +262,7 @@ local function build(seedKey, run)
 		materials[#materials + 1] = ("%dx %s"):format(n, id)
 	end
 	table.sort(materials)
-	notify("Building Plateau", ("%d blocks: %s"):format(total, table.concat(materials, ", ")))
+	notify("Building Mountain", ("%d blocks: %s"):format(total, table.concat(materials, ", ")))
 
 	local frontierByY = {}
 	local function addFrontier(key, c)
@@ -431,7 +425,7 @@ end
 
 -- ===== UI =====
 Tab:CreateToggle(dual({
-	name = "Build Hollow Plateau",
+	name = "Build Expanding Mountain",
 	flag = "AutoBuilder",
 	currentValue = false,
 	callback = function(on)
@@ -441,7 +435,6 @@ Tab:CreateToggle(dual({
 		if not on then return end
 		
 		shapeSeed = math.random(1, 100000)
-
 		BlocksFolder = findBlocksFolder()
 		if not BlocksFolder then return end
 
@@ -451,8 +444,8 @@ Tab:CreateToggle(dual({
 		local run = RunId
 		table.insert(conns, BlocksFolder.ChildAdded:Connect(function(block) onBlockAdded(block, run) end))
 		table.insert(conns, BlocksFolder.ChildRemoved:Connect(unregister))
-		notify("Plateau Builder on", "Place a block at the CENTER.")
+		notify("Mountain Builder on", "Place a block at the CENTER.")
 	end,
 }))
 
-notify("VANTA Hollow Plateau", "Loaded. Place a block at the center.")
+notify("VANTA Expanding Mountain", "Loaded. Place a block at the center.")
