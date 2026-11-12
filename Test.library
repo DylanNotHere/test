@@ -1,4 +1,4 @@
--- autobuilder_v30.0.0 (Claude's Engine + Expanding Cliffs)
+-- autobuilder_v31.0.0 (Claude's Engine + Working Cliffs)
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -16,9 +16,9 @@ local function dual(t)
 end
 
 local Window = Rayfield:CreateWindow(dual({
-	name = "VANTA | Expanding Mountain",
+	name = "VANTA | Cliff Builder",
 	loadingTitle = "VANTA",
-	loadingSubtitle = "Claude Engine + Cliffs",
+	loadingSubtitle = "Working Hollow Cliffs",
 }))
 local Tab = Window:CreateTab(dual({ name = "Builder" }))
 
@@ -61,7 +61,7 @@ local function notify(title, content)
 end
 
 -- ==================================================
--- EXPANDING CLIFF BLUEPRINT (Hollow Shell)
+-- WORKING BLUEPRINT (Solid Columns, Hollow Center)
 -- ==================================================
 local function getRadius(baseRadius, x, z)
 	local angle = math.atan2(z, x)
@@ -85,38 +85,43 @@ local function terrainBlueprint(sx, sy, sz)
 			local r2 = getRadius(CFG.Tier2Base, x, z)
 			local r3 = getRadius(CFG.Tier3Base, x, z)
 			
-			-- Tier 1 Floor
+			local topY = -1
+			local isTier1 = false
+			local isTier2 = false
+			local isTier3 = false
+			
 			if dist <= r1 then
-				addBlock(x, 0, z, "GrassBlock")
+				isTier1 = true
+				topY = 0
+			elseif dist <= r1 + CFG.SlopeWidth then
+				local step = math.floor(dist - r1)
+				topY = CFG.LevelHeight - 1 - (step * 2)
+			elseif dist <= r2 then
+				isTier2 = true
+				topY = CFG.LevelHeight
+			elseif dist <= r2 + CFG.SlopeWidth then
+				local step = math.floor(dist - r2)
+				topY = CFG.LevelHeight * 2 - 1 - (step * 2)
+			elseif dist <= r3 then
+				isTier3 = true
+				topY = CFG.LevelHeight * 2
 			end
 			
-			-- Tier 2 Floor
-			if dist <= r2 then
-				addBlock(x, CFG.LevelHeight, z, "GrassBlock")
-			end
-			
-			-- Tier 3 Floor
-			if dist <= r3 then
-				addBlock(x, CFG.LevelHeight * 2, z, "GrassBlock")
-			end
-			
-			-- Slope 1 (Tier 1 to Tier 2)
-			if dist > r1 and dist <= r1 + CFG.SlopeWidth then
-				local progress = (dist - r1) / CFG.SlopeWidth
-				local topY = math.floor(progress * (CFG.LevelHeight - 1))
-				for y = 1, topY do
-					local blockType = (math.random(1, 100) <= 50) and "StoneBlock" or "StoneBrick"
-					addBlock(x, y, z, blockType)
-				end
-			end
-			
-			-- Slope 2 (Tier 2 to Tier 3)
-			if dist > r2 and dist <= r2 + CFG.SlopeWidth then
-				local progress = (dist - r2) / CFG.SlopeWidth
-				local topY = CFG.LevelHeight + math.floor(progress * (CFG.LevelHeight - 1))
-				for y = CFG.LevelHeight + 1, topY do
-					local blockType = (math.random(1, 100) <= 50) and "StoneBlock" or "StoneBrick"
-					addBlock(x, y, z, blockType)
+			if topY >= 0 then
+				if isTier1 or isTier2 or isTier3 then
+					addBlock(x, topY, z, "GrassBlock")
+				else
+					local bottomY = 0
+					if dist > r2 then
+						bottomY = CFG.LevelHeight
+					elseif dist > r1 then
+						bottomY = 0
+					end
+					
+					for y = bottomY, topY do
+						local blockType = (math.random(1, 100) <= 50) and "StoneBlock" or "StoneBrick"
+						addBlock(x, y, z, blockType)
+					end
 				end
 			end
 		end
@@ -239,7 +244,7 @@ local function glideAbove(pos, offset, run)
 	end)
 end
 
--- ===== Claude's Flawless Snake Builder =====
+-- ===== the snake builder =====
 local function build(seedKey, run)
 	local Remote = RS:WaitForChild("Remotes"):WaitForChild("RequestPlace")
 	local sx, sy, sz = seedKey:match(KEY_PATTERN)
@@ -262,7 +267,7 @@ local function build(seedKey, run)
 		materials[#materials + 1] = ("%dx %s"):format(n, id)
 	end
 	table.sort(materials)
-	notify("Building Mountain", ("%d blocks: %s"):format(total, table.concat(materials, ", ")))
+	notify("Building Plateau", ("%d blocks: %s"):format(total, table.concat(materials, ", ")))
 
 	local frontierByY = {}
 	local function addFrontier(key, c)
@@ -435,6 +440,7 @@ Tab:CreateToggle(dual({
 		if not on then return end
 		
 		shapeSeed = math.random(1, 100000)
+
 		BlocksFolder = findBlocksFolder()
 		if not BlocksFolder then return end
 
@@ -444,8 +450,8 @@ Tab:CreateToggle(dual({
 		local run = RunId
 		table.insert(conns, BlocksFolder.ChildAdded:Connect(function(block) onBlockAdded(block, run) end))
 		table.insert(conns, BlocksFolder.ChildRemoved:Connect(unregister))
-		notify("Mountain Builder on", "Place a block at the CENTER.")
+		notify("Plateau Builder on", "Place a block at the CENTER.")
 	end,
 }))
 
-notify("VANTA Expanding Mountain", "Loaded. Place a block at the center.")
+notify("VANTA Cliff Builder", "Loaded. Place a block at the center.")
