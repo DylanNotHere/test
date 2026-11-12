@@ -1,4 +1,4 @@
--- autobuilder_v26.0.0 (Hollow Sloped Plateau)
+-- autobuilder_v28.0.0 (Flawless Hollow Plateau)
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -36,7 +36,7 @@ local CFG = {
 	Tier3Base = 50,       
 	NoiseScale = 8,       
 	LevelHeight = 7,      
-	SlopeWidth = 3,       
+	SkirtThickness = 3, 
 	FloorBlock = "GrassBlock",
 	CliffBlockA = "StoneBlock",
 	CliffBlockB = "StoneBrick",
@@ -64,7 +64,7 @@ local function notify(title, content)
 end
 
 -- ==================================================
--- HOLLOW SLOPED TERRAIN BLUEPRINT
+-- FLAWLESS HOLLOW BLUEPRINT
 -- ==================================================
 local function getRadius(baseRadius, x, z)
 	local angle = math.atan2(z, x)
@@ -93,42 +93,36 @@ local function terrainBlueprint(sx, sy, sz)
 			local r2 = getRadius(CFG.Tier2Base, x, z)
 			local r3 = getRadius(CFG.Tier3Base, x, z)
 			
-			local topY = -1
-			local isTier1 = false
-			local isTier2 = false
-			local isTier3 = false
-			
+			-- 1. Build Tier 1 Floor
 			if dist <= r1 then
-				isTier1 = true
-				topY = 0
-			elseif dist <= r1 + CFG.SlopeWidth then
-				local step = math.floor(dist - r1)
-				topY = CFG.LevelHeight - 1 - (step * 2)
-			elseif dist <= r2 then
-				isTier2 = true
-				topY = CFG.LevelHeight
-			elseif dist <= r2 + CFG.SlopeWidth then
-				local step = math.floor(dist - r2)
-				topY = CFG.LevelHeight * 2 - 1 - (step * 2)
-			elseif dist <= r3 then
-				isTier3 = true
-				topY = CFG.LevelHeight * 2
+				addBlock(x, 0, z, CFG.FloorBlock)
 			end
 			
-			if topY >= 0 then
-				if isTier1 or isTier2 or isTier3 then
-					addBlock(x, topY, z, CFG.FloorBlock)
-				else
-					local bottomY = 0
-					if dist > r2 then
-						bottomY = CFG.LevelHeight
-					elseif dist > r1 then
-						bottomY = 0
-					end
-					
-					for y = bottomY, topY do
+			-- 2. Build Tier 2 Skirt & Floor
+			if dist <= r2 then
+				-- Skirt dropping down to Tier 1
+				if dist > r1 and dist <= r1 + CFG.SkirtThickness then
+					for y = 1, CFG.LevelHeight - 1 do
 						addBlock(x, y, z, getRockBlock(x, y, z))
 					end
+				end
+				-- The Floor
+				if dist <= r2 and dist > r1 then
+					addBlock(x, CFG.LevelHeight, z, CFG.FloorBlock)
+				end
+			end
+			
+			-- 3. Build Tier 3 Skirt & Floor
+			if dist <= r3 then
+				-- Skirt dropping down to Tier 2
+				if dist > r2 and dist <= r2 + CFG.SkirtThickness then
+					for y = CFG.LevelHeight + 1, CFG.LevelHeight * 2 - 1 do
+						addBlock(x, y, z, getRockBlock(x, y, z))
+					end
+				end
+				-- The Floor
+				if dist <= r3 and dist > r2 then
+					addBlock(x, CFG.LevelHeight * 2, z, CFG.FloorBlock)
 				end
 			end
 		end
