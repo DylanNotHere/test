@@ -1,4 +1,4 @@
--- autobuilder_v25.0.0 (Solid Stepped Plateau)
+-- autobuilder_v26.0.0 (Hollow Sloped Plateau)
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -16,9 +16,9 @@ local function dual(t)
 end
 
 local Window = Rayfield:CreateWindow(dual({
-	name = "VANTA | Sloped Plateau",
+	name = "VANTA | Hollow Plateau",
 	loadingTitle = "VANTA",
-	loadingSubtitle = "Terraced Cliff Base",
+	loadingSubtitle = "Hollow Cliff Base",
 }))
 local Tab = Window:CreateTab(dual({ name = "Builder" }))
 
@@ -64,7 +64,7 @@ local function notify(title, content)
 end
 
 -- ==================================================
--- SOLID STEPPED TERRAIN BLUEPRINT
+-- HOLLOW SLOPED TERRAIN BLUEPRINT
 -- ==================================================
 local function getRadius(baseRadius, x, z)
 	local angle = math.atan2(z, x)
@@ -85,7 +85,6 @@ local function terrainBlueprint(sx, sy, sz)
 		cells[fmt(wx, wy, wz)] = {wx, wy, wz, blockType}
 	end
 
-	-- Iterate over the max footprint of the entire build
 	for x = -70, 70 do
 		for z = -70, 70 do
 			local dist = math.sqrt(x*x + z*z)
@@ -94,7 +93,6 @@ local function terrainBlueprint(sx, sy, sz)
 			local r2 = getRadius(CFG.Tier2Base, x, z)
 			local r3 = getRadius(CFG.Tier3Base, x, z)
 			
-			-- Determine the top height for this specific column
 			local topY = -1
 			local isTier1 = false
 			local isTier2 = false
@@ -104,14 +102,12 @@ local function terrainBlueprint(sx, sy, sz)
 				isTier1 = true
 				topY = 0
 			elseif dist <= r1 + CFG.SlopeWidth then
-				-- Slope 1 to 2
 				local step = math.floor(dist - r1)
 				topY = CFG.LevelHeight - 1 - (step * 2)
 			elseif dist <= r2 then
 				isTier2 = true
 				topY = CFG.LevelHeight
 			elseif dist <= r2 + CFG.SlopeWidth then
-				-- Slope 2 to 3
 				local step = math.floor(dist - r2)
 				topY = CFG.LevelHeight * 2 - 1 - (step * 2)
 			elseif dist <= r3 then
@@ -119,17 +115,20 @@ local function terrainBlueprint(sx, sy, sz)
 				topY = CFG.LevelHeight * 2
 			end
 			
-			-- If this column is part of the build, fill it from the bottom up
 			if topY >= 0 then
-				for y = 0, topY do
-					local blockType = getRockBlock(x, y, z)
-					
-					-- Place the grass on the exact top layer
-					if y == topY and (isTier1 or isTier2 or isTier3) then
-						blockType = CFG.FloorBlock
+				if isTier1 or isTier2 or isTier3 then
+					addBlock(x, topY, z, CFG.FloorBlock)
+				else
+					local bottomY = 0
+					if dist > r2 then
+						bottomY = CFG.LevelHeight
+					elseif dist > r1 then
+						bottomY = 0
 					end
 					
-					addBlock(x, y, z, blockType)
+					for y = bottomY, topY do
+						addBlock(x, y, z, getRockBlock(x, y, z))
+					end
 				end
 			end
 		end
@@ -438,7 +437,7 @@ end
 
 -- ===== UI =====
 Tab:CreateToggle(dual({
-	name = "Build Sloped Plateau",
+	name = "Build Hollow Plateau",
 	flag = "AutoBuilder",
 	currentValue = false,
 	callback = function(on)
@@ -462,4 +461,4 @@ Tab:CreateToggle(dual({
 	end,
 }))
 
-notify("VANTA Sloped Plateau", "Loaded. Place a block at the center.")
+notify("VANTA Hollow Plateau", "Loaded. Place a block at the center.")
