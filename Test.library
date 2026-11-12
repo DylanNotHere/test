@@ -1,4 +1,4 @@
--- autocastle_v13.0.0 (Majestic Cruciform Castle)
+-- autocastle_v15.0.0 (Single Toggle Medieval Keep)
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -16,9 +16,9 @@ local function dual(t)
 end
 
 local Window = Rayfield:CreateWindow(dual({
-	name = "VANTA | Legendary Castle",
+	name = "VANTA | Medieval Keep",
 	loadingTitle = "VANTA",
-	loadingSubtitle = "Shop Mega-Base",
+	loadingSubtitle = "One Toggle Build",
 }))
 local Tab = Window:CreateTab(dual({ name = "Builder" }))
 
@@ -30,12 +30,16 @@ local CFG = {
 	GlideSpeed = 35,
 	HoverHeight = 4,
 	
-	-- CASTLE SETTINGS
-	Radius = 30,          -- 30 = 60x60 footprint
-	WallHeight = 12,      -- Main wing walls
-	KeepHeight = 25,      -- Center keep
-	TowerHeight = 35,     -- Corner towers
-	BlockType = "StoneBrick",
+	-- KEEP SETTINGS
+	KeepSize = 15,        -- 30x30 central keep
+	KeepHeight = 30,      
+	TowerRadius = 4,      
+	TowerHeight = 25,     
+	WallDistance = 40,    -- 80x80 footprint
+	WallHeight = 12,      
+	WallBlock = "StoneBrick",
+	TowerBlock = "StoneBrick",
+	FloorBlock = "StoneBlock",
 }
 
 local FIXED_NORMAL = Vector3.new(-1, 0, 0)
@@ -58,111 +62,79 @@ local function notify(title, content)
 end
 
 -- ==================================================
--- MAJESTIC CASTLE BLUEPRINT
+-- MEDIEVAL KEEP BLUEPRINT
 -- ==================================================
 local function terrainBlueprint(sx, sy, sz)
 	local cells = {}
-	local r = CFG.Radius
-	local wallH = CFG.WallHeight
-	local keepH = CFG.KeepHeight
-	local towerH = CFG.TowerHeight
-	local block = CFG.BlockType
-
-	local function addBlock(x, y, z, bType)
+	
+	local function addBlock(x, y, z, blockType)
 		local wx, wy, wz = sx + x, sy + y, sz + z
-		cells[fmt(wx, wy, wz)] = {wx, wy, wz, bType or block}
+		cells[fmt(wx, wy, wz)] = {wx, wy, wz, blockType or CFG.WallBlock}
 	end
 
-	-- 1. Build the Cross Wings
-	-- We build 4 rectangular wings extending from the center.
-	local wingWidth = 8
-	for x = -r, r do
-		for z = -r, r do
-			-- Check if the block is part of the cross wings
-			local isWingX = math.abs(z) <= wingWidth
-			local isWingZ = math.abs(x) <= wingWidth
-			
-			if isWingX or isWingZ then
-				-- Floor for the wings
-				addBlock(x, 0, z, "StoneBlock") -- Use StoneBlock for the floor
-				
-				-- Wing Walls (only the outer edges of the wings)
-				local isEdge = (isWingX and (math.abs(z) == wingWidth or math.abs(x) == r)) or
-				               (isWingZ and (math.abs(x) == wingWidth or math.abs(z) == r))
-				               
-				if isEdge then
-					-- Leave a gate in the front and back
-					local isGate = (math.abs(x) == r and math.abs(z) <= 2) or (math.abs(z) == r and math.abs(x) <= 2)
-					if not isGate then
-						for y = 1, wallH do
-							addBlock(x, y, z)
-						end
-						-- Battlements
-						if math.abs(x) % 2 == 0 and math.abs(z) % 2 == 0 then
-							addBlock(x, wallH + 1, z)
-						end
-					end
-				end
-			end
-		end
-	end
-
-	-- 2. Build the Central Keep (Massive Tower)
-	local keepRadius = 10
-	for x = -keepRadius, keepRadius do
-		for z = -keepRadius, keepRadius do
+	-- 1. Central Keep
+	local kr = CFG.KeepSize
+	local kh = CFG.KeepHeight
+	for x = -kr, kr do
+		for z = -kr, kr do
 			local dist = math.sqrt(x*x + z*z)
-			if dist <= keepRadius then
-				addBlock(x, 0, z, "StoneBlock") -- Keep floor
-				
-				-- Keep Walls
-				if dist > keepRadius - 2 then
-					-- Gate facing South
-					local isGate = z > 0 and math.abs(x) <= 2
+			if dist <= kr then
+				addBlock(x, 0, z, CFG.FloorBlock)
+				if dist > kr - 2 then
+					local isGate = z > 0 and math.abs(x) <= 3
 					if not isGate then
-						for y = 1, keepH do
-							addBlock(x, y, z)
+						for y = 1, kh do addBlock(x, y, z, CFG.TowerBlock) end
+					end
+				end
+			end
+		end
+	end
+	for x = -kr, kr do
+		for z = -kr, kr do
+			if math.sqrt(x*x + z*z) <= kr then addBlock(x, kh, z, CFG.TowerBlock) end
+		end
+	end
+
+	-- 2. Outer Wall
+	local wr = CFG.WallDistance
+	local wh = CFG.WallHeight
+	for x = -wr, wr do
+		for z = -wr, wr do
+			local dist = math.sqrt(x*x + z*z)
+			if dist <= wr then
+				if dist > wr - 3 then addBlock(x, 0, z, CFG.FloorBlock) end
+				if dist > wr - 2 then
+					local isGate = z > 0 and math.abs(x) <= 4
+					if not isGate then
+						for y = 1, wh do addBlock(x, y, z, CFG.WallBlock) end
+						if math.abs(x) % 2 == 0 and math.abs(z) % 2 == 0 then
+							addBlock(x, wh + 1, z, CFG.WallBlock)
 						end
 					end
 				end
 			end
 		end
 	end
-	-- Roof for the Keep
-	for x = -keepRadius, keepRadius do
-		for z = -keepRadius, keepRadius do
-			if math.sqrt(x*x + z*z) <= keepRadius then
-				addBlock(x, keepH, z)
-			end
-		end
-	end
 
-	-- 3. Build 4 Corner Towers (Circular)
-	local towerRadius = 6
+	-- 3. Corner Towers
+	local tr = CFG.TowerRadius
+	local th = CFG.TowerHeight
 	local towerSpots = {
-		{r, r}, {-r, r},
-		{r, -r}, {-r, -r}
+		{wr, wr}, {-wr, wr},
+		{wr, -wr}, {-wr, -wr}
 	}
-
 	for _, spot in ipairs(towerSpots) do
 		local tx, tz = spot[1], spot[2]
-		for x = -towerRadius, towerRadius do
-			for z = -towerRadius, towerRadius do
+		for x = -tr, tr do
+			for z = -tr, tr do
 				local dist = math.sqrt(x*x + z*z)
-				if dist <= towerRadius then
-					-- Only build the outer shell
-					if dist > towerRadius - 2 then
-						for y = 1, towerH do
-							addBlock(tx + x, y, tz + z)
-						end
+				if dist <= tr then
+					addBlock(tx + x, 0, tz + z, CFG.FloorBlock)
+					if dist > tr - 2 then
+						for y = 1, th do addBlock(tx + x, y, tz + z, CFG.TowerBlock) end
 					end
-					-- Tower Roof (Pointed)
-					if dist <= towerRadius then
-						addBlock(tx + x, towerH + 1, tz + z)
-					end
-					if dist <= towerRadius - 2 then
-						addBlock(tx + x, towerH + 2, tz + z)
-					end
+					if dist <= tr then addBlock(tx + x, th + 1, tz + z, CFG.TowerBlock) end
+					if dist <= tr - 2 then addBlock(tx + x, th + 2, tz + z, CFG.TowerBlock) end
 				end
 			end
 		end
@@ -308,7 +280,7 @@ local function build(seedKey, run)
 		materials[#materials + 1] = ("%dx %s"):format(n, id)
 	end
 	table.sort(materials)
-	notify("Building the Castle", ("%d blocks: %s"):format(total, table.concat(materials, ", ")))
+	notify("Building Keep", ("%d blocks: %s"):format(total, table.concat(materials, ", ")))
 
 	local frontierByY = {}
 	local function addFrontier(key, c)
@@ -471,7 +443,7 @@ end
 
 -- ===== UI =====
 Tab:CreateToggle(dual({
-	name = "Build Legendary Castle",
+	name = "Build Medieval Keep",
 	flag = "AutoBuilder",
 	currentValue = false,
 	callback = function(on)
@@ -493,16 +465,4 @@ Tab:CreateToggle(dual({
 	end,
 }))
 
-pcall(function()
-	Tab:CreateSlider(dual({
-		name = "Place Delay",
-		flag = "BuilderDelay",
-		range = { 0.03, 1 },
-		increment = 0.01,
-		suffix = " s",
-		currentValue = CFG.PlaceDelay,
-		callback = function(v) CFG.PlaceDelay = v end,
-	}))
-end)
-
-notify("VANTA Legendary Castle", "Loaded. Place a block at the center.")
+notify("VANTA Medieval Keep", "Loaded. Place a block at the center.")
