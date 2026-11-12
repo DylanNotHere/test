@@ -1,4 +1,4 @@
--- autobuilder_v20.1.0 (Scaled Organic Cliff Base)
+-- autobuilder_v22.0.0 (Terraced Cliff Plateau)
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -16,9 +16,9 @@ local function dual(t)
 end
 
 local Window = Rayfield:CreateWindow(dual({
-	name = "VANTA | Organic Plateau",
+	name = "VANTA | Cliff Plateau",
 	loadingTitle = "VANTA",
-	loadingSubtitle = "17k Limit Base",
+	loadingSubtitle = "Skyblock Fortress",
 }))
 local Tab = Window:CreateTab(dual({ name = "Builder" }))
 
@@ -30,15 +30,15 @@ local CFG = {
 	GlideSpeed = 45,
 	HoverHeight = 4,
 	
-	-- SCALED DOWN TO FIT 17K BLOCKS
-	Tier1Base = 35,       -- 70x70 base
-	Tier2Base = 20,       -- 40x40 middle
-	Tier3Base = 10,       -- 20x20 top
-	NoiseScale = 6,       -- How jagged the edges are
-	LevelHeight = 20,     -- Height of the cliff walls
+	-- TERRAIN SETTINGS
+	Tier1Base = 40,       -- 80x80 bottom
+	Tier2Base = 30,       -- 60x60 middle
+	Tier3Base = 20,       -- 40x40 top (Shop area)
+	NoiseScale = 6,       -- Jaggedness
+	LevelHeight = 10,     -- Height of each cliff wall
 	WallThickness = 2,    -- Thickness of the cliff walls
 	
-	FloorBlock = "StoneBrick",
+	FloorBlock = "GrassBlock",
 	CliffBlock = "StoneBlock",
 }
 
@@ -64,7 +64,7 @@ local function notify(title, content)
 end
 
 -- ==================================================
--- ORGANIC PLATEAU BLUEPRINT
+-- TERRACED CLIFF BLUEPRINT
 -- ==================================================
 local function getRadius(baseRadius, x, z)
 	local angle = math.atan2(z, x)
@@ -81,8 +81,8 @@ local function terrainBlueprint(sx, sy, sz)
 	end
 
 	-- 1. Build Tier 1 (Bottom Floor)
-	for x = -50, 50 do
-		for z = -50, 50 do
+	for x = -55, 55 do
+		for z = -55, 55 do
 			local dist = math.sqrt(x*x + z*z)
 			local r = getRadius(CFG.Tier1Base, x, z)
 			if dist <= r then
@@ -92,8 +92,8 @@ local function terrainBlueprint(sx, sy, sz)
 	end
 
 	-- 2. Build Tier 2 (Middle Floor & Cliff)
-	for x = -40, 40 do
-		for z = -40, 40 do
+	for x = -45, 45 do
+		for z = -45, 45 do
 			local dist = math.sqrt(x*x + z*z)
 			local r = getRadius(CFG.Tier2Base, x, z)
 			
@@ -112,8 +112,8 @@ local function terrainBlueprint(sx, sy, sz)
 	end
 
 	-- 3. Build Tier 3 (Top Floor & Cliff)
-	for x = -30, 30 do
-		for z = -30, 30 do
+	for x = -35, 35 do
+		for z = -35, 35 do
 			local dist = math.sqrt(x*x + z*z)
 			local r = getRadius(CFG.Tier3Base, x, z)
 			
@@ -434,7 +434,7 @@ end
 
 -- ===== UI =====
 Tab:CreateToggle(dual({
-	name = "Build Random Plateau",
+	name = "Build Cliff Plateau",
 	flag = "AutoBuilder",
 	currentValue = false,
 	callback = function(on)
@@ -458,4 +458,4 @@ Tab:CreateToggle(dual({
 	end,
 }))
 
-notify("VANTA Organic Plateau", "Loaded. Place a block at the center.")
+notify("VANTA Cliff Plateau", "Loaded. Place a block at the center.")
