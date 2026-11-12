@@ -1,4 +1,4 @@
--- autobuilder_v31.0.0 (Claude's Engine + Working Cliffs)
+-- autobuilder_v33.0.0 (Top-Down Hollow Mountain)
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -16,27 +16,29 @@ local function dual(t)
 end
 
 local Window = Rayfield:CreateWindow(dual({
-	name = "VANTA | Cliff Builder",
+	name = "VANTA | Hollow Mountain",
 	loadingTitle = "VANTA",
-	loadingSubtitle = "Working Hollow Cliffs",
+	loadingSubtitle = "Top-Down Cliffs",
 }))
 local Tab = Window:CreateTab(dual({ name = "Builder" }))
 
 local CFG = {
-	PlaceDelay = 0.1,
+	PlaceDelay = 0.04,
 	MaxDelay = 1.0,
 	CheckTimeout = 3,
 	MaxRetries = 4,
-	GlideSpeed = 30,
+	GlideSpeed = 45,
 	HoverHeight = 4,
 	
-	-- TERRAIN SETTINGS
-	Tier1Base = 20,
-	Tier2Base = 35,
-	Tier3Base = 50,
-	NoiseScale = 8,
-	LevelHeight = 7,
-	SlopeWidth = 4,
+	-- EXPANDING TERRAIN SETTINGS
+	Tier1Base = 20,       
+	Tier2Base = 35,       
+	Tier3Base = 50,       
+	NoiseScale = 8,       
+	LevelHeight = 7,      
+	FloorBlock = "GrassBlock",
+	CliffBlockA = "StoneBlock",
+	CliffBlockB = "StoneBrick",
 }
 
 local FIXED_NORMAL = Vector3.new(-1, 0, 0)
@@ -61,12 +63,17 @@ local function notify(title, content)
 end
 
 -- ==================================================
--- WORKING BLUEPRINT (Solid Columns, Hollow Center)
+-- TOP-DOWN HOLLOW BLUEPRINT
 -- ==================================================
 local function getRadius(baseRadius, x, z)
 	local angle = math.atan2(z, x)
 	local noise = math.noise(math.cos(angle) * 2, math.sin(angle) * 2, shapeSeed)
 	return baseRadius + (noise * CFG.NoiseScale)
+end
+
+local function getRockBlock(x, y, z)
+    local noise = math.noise(x * 0.5, y * 0.5, z * 0.5)
+    if noise > 0 then return CFG.CliffBlockA else return CFG.CliffBlockB end
 end
 
 local function terrainBlueprint(sx, sy, sz)
@@ -77,51 +84,52 @@ local function terrainBlueprint(sx, sy, sz)
 		cells[fmt(wx, wy, wz)] = {wx, wy, wz, blockType}
 	end
 
+	-- Build the top tier floor first
 	for x = -70, 70 do
 		for z = -70, 70 do
 			local dist = math.sqrt(x*x + z*z)
-			
-			local r1 = getRadius(CFG.Tier1Base, x, z)
+			local r3 = getRadius(CFG.Tier3Base, x, z)
+			if dist <= r3 then
+				addBlock(x, CFG.LevelHeight * 2, z, CFG.FloorBlock)
+			end
+		end
+	end
+
+	-- Build the middle tier floor and cliff
+	for x = -70, 70 do
+		for z = -70, 70 do
+			local dist = math.sqrt(x*x + z*z)
 			local r2 = getRadius(CFG.Tier2Base, x, z)
 			local r3 = getRadius(CFG.Tier3Base, x, z)
 			
-			local topY = -1
-			local isTier1 = false
-			local isTier2 = false
-			local isTier3 = false
-			
-			if dist <= r1 then
-				isTier1 = true
-				topY = 0
-			elseif dist <= r1 + CFG.SlopeWidth then
-				local step = math.floor(dist - r1)
-				topY = CFG.LevelHeight - 1 - (step * 2)
-			elseif dist <= r2 then
-				isTier2 = true
-				topY = CFG.LevelHeight
-			elseif dist <= r2 + CFG.SlopeWidth then
-				local step = math.floor(dist - r2)
-				topY = CFG.LevelHeight * 2 - 1 - (step * 2)
-			elseif dist <= r3 then
-				isTier3 = true
-				topY = CFG.LevelHeight * 2
+			if dist <= r2 then
+				addBlock(x, CFG.LevelHeight, z, CFG.FloorBlock)
 			end
 			
-			if topY >= 0 then
-				if isTier1 or isTier2 or isTier3 then
-					addBlock(x, topY, z, "GrassBlock")
-				else
-					local bottomY = 0
-					if dist > r2 then
-						bottomY = CFG.LevelHeight
-					elseif dist > r1 then
-						bottomY = 0
-					end
-					
-					for y = bottomY, topY do
-						local blockType = (math.random(1, 100) <= 50) and "StoneBlock" or "StoneBrick"
-						addBlock(x, y, z, blockType)
-					end
+			-- Cliff from middle to top
+			if dist > r2 and dist <= r3 then
+				for y = CFG.LevelHeight + 1, CFG.LevelHeight * 2 - 1 do
+					addBlock(x, y, z, getRockBlock(x, y, z))
+				end
+			end
+		end
+	end
+
+	-- Build the bottom tier floor and cliff
+	for x = -70, 70 do
+		for z = -70, 70 do
+			local dist = math.sqrt(x*x + z*z)
+			local r1 = getRadius(CFG.Tier1Base, x, z)
+			local r2 = getRadius(CFG.Tier2Base, x, z)
+			
+			if dist <= r1 then
+				addBlock(x, 0, z, CFG.FloorBlock)
+			end
+			
+			-- Cliff from bottom to middle
+			if dist > r1 and dist <= r2 then
+				for y = 1, CFG.LevelHeight - 1 do
+					addBlock(x, y, z, getRockBlock(x, y, z))
 				end
 			end
 		end
@@ -430,7 +438,7 @@ end
 
 -- ===== UI =====
 Tab:CreateToggle(dual({
-	name = "Build Expanding Mountain",
+	name = "Build Hollow Mountain",
 	flag = "AutoBuilder",
 	currentValue = false,
 	callback = function(on)
@@ -454,4 +462,4 @@ Tab:CreateToggle(dual({
 	end,
 }))
 
-notify("VANTA Cliff Builder", "Loaded. Place a block at the center.")
+notify("VANTA Hollow Mountain", "Loaded. Place a block at the center.")
