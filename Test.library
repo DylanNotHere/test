@@ -1,5 +1,5 @@
 -- ==================================================
--- VANTA | AUTO BUILD CIRCLE (Grass)
+-- VANTA | BERRY PLANTER (Snake Pattern)
 -- ==================================================
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -18,15 +18,14 @@ local function dual(t)
 end
 
 local Window = Rayfield:CreateWindow(dual({
-	name = "VANTA | Circle Builder",
+	name = "VANTA | Berry Planter",
 	loadingTitle = "VANTA",
-	loadingSubtitle = "2D Platform",
+	loadingSubtitle = "Snake Pattern",
 }))
-local Tab = Window:CreateTab(dual({ name = "Builder" }))
+local Tab = Window:CreateTab(dual({ name = "Planter" }))
 
 local CFG = {
-	Radius = 62,      -- Radius in blocks (12,000 blocks approx)
-	BlockType = "GrassBlock", -- Set to GrassBlock
+	SeedType = "BerrySeed", 
 	PlaceDelay = 0.04,
 	MaxDelay = 1.0,
 	CheckTimeout = 3,
@@ -35,7 +34,7 @@ local CFG = {
 	HoverHeight = 4,
 }
 
-local FIXED_NORMAL = Vector3.new(-1, 0, 0)
+local FIXED_NORMAL = Vector3.new(0, 1, 0)
 local KEY_PATTERN = "^(-?%d+),(-?%d+),(-?%d+)$"
 local DIRS = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} }
 local HORIZONTAL = { {1,0}, {-1,0}, {0,1}, {0,-1} }
@@ -46,8 +45,6 @@ local function notify(title, content) pcall(function() Window:Notify(dual({ titl
 -- ===== STATE =====
 local Enabled = false
 local RunId = 0
-local building = false
-local buildStart, buildEnd = math.huge, 0
 local BlocksFolder, occupied, blockKey, conns = nil, {}, {}, {}
 
 local function findBlocksFolder()
@@ -72,11 +69,6 @@ local function register(block)
 		if k then occupied[k] = block; blockKey[block] = k; conn:Disconnect() end
 	end)
 	task.delay(3, function() if conn.Connected then conn:Disconnect() end end)
-end
-
-local function unregister(block)
-	local key = blockKey[block]
-	if key then if occupied[key] == block then occupied[key] = nil end; blockKey[block] = nil end
 end
 
 local function blockPos(b) return b:IsA("BasePart") and b.Position or b:GetPivot().Position end
@@ -133,190 +125,145 @@ local function glideAbove(pos, offset, run)
 	return glideActive(pos + Vector3.new(0, offset, 0), function() return Enabled and run == RunId end)
 end
 
--- ===== GENERATE CIRCLE BLUEPRINT =====
-local function generateCircle(cx, cy, cz, radius)
-	local cells = {}
-	local rSq = radius * radius
-	local count = 0
-	
-	-- Loop through a square bounding box
-	for x = -radius, radius do
-		for z = -radius, radius do
-			-- If it's inside the circle
-			if (x*x + z*z) <= rSq then
-				local wx, wy, wz = cx + x, cy, cz + z
-				cells[fmt(wx, wy, wz)] = {wx, wy, wz, CFG.BlockType}
-				count = count + 1
-			end
-		end
-	end
-	return cells, count
-end
-
--- ===== SNAKE BUILDER =====
-local function build(seedKey, run)
+-- ===== SNAKE PLANTER =====
+local function plant(run)
 	local Remote = RS:WaitForChild("Remotes"):WaitForChild("RequestPlace")
-	local sx, sy, sz = seedKey:match(KEY_PATTERN)
-	sx, sy, sz = tonumber(sx), tonumber(sy), tonumber(sz)
-	if not sx then return end
+	
+	-- Find all GrassBlocks and determine top layer
+	local topLayer = {}
+	local maxY = -math.huge
+	
+	for key, block in pairs(occupied) do
+		local id = block:GetAttribute("BlockId")
+		if id == "GrassBlock" then
+			local x, y, z = key:match(KEY_PATTERN)
+			x, y, z = tonumber(x), tonumber(y), tonumber(z)
+			if y > maxY then maxY = y end
+		end
+	end
 
-	notify("Generating Circle", ("Radius: %d"):format(CFG.Radius))
-	local blueprint, total = generateCircle(sx, sy, sz, CFG.Radius)
-	notify("Building Circle", ("%d blocks to place."):format(total))
+	if maxY == -math.huge then
+		notify("Error", "No GrassBlocks found on island.")
+		return
+	end
 
-	local pending, counts = {}, {}
-	for key, c in pairs(blueprint) do
-		if not occupied[key] then
+	-- Build a lookup table of the top layer grass
+	local validSupports = {}
+	for key, block in pairs(occupied) do
+		local id = block:GetAttribute("BlockId")
+		if id == "GrassBlock" then
+			local x, y, z = key:match(KEY_PATTERN)
+			x, y, z = tonumber(x), tonumber(y), tonumber(z)
+			if y == maxY then
+				validSupports[key] = { x = x, y = y, z = z }
+			end
+		end
+	end
+
+	-- Setup snake frontier
+	local pending = {}
+	local frontier = {}
+	
+	local function addPending(x, y, z)
+		local key = fmt(x, y, z)
+		-- Only plant if the cell above is empty
+		if not occupied[key] and validSupports[fmt(x, y - 1, z)] then
+			local c = { x = x, y = y, z = z, key = key }
 			pending[key] = c
-			counts[c[4]] = (counts[c[4]] or 0) + 1
+			table.insert(frontier, c)
 		end
 	end
 
-	local frontierByY = {}
-	local function addFrontier(key, c)
-		local set = frontierByY[c[2]]
-		if not set then set = {}; frontierByY[c[2]] = set end
-		set[key] = c
+	-- Fill pending based on grass
+	for _, v in pairs(validSupports) do
+		addPending(v.x, v.y + 1, v.z)
 	end
 
-	for key, c in pairs(pending) do
-		for _, d in ipairs(DIRS) do
-			if occupied[fmt(c[1]+d[1], c[2]+d[2], c[3]+d[3])] then addFrontier(key, c); break end
-		end
+	if #frontier == 0 then
+		notify("Error", "No valid spots to plant.")
+		return
 	end
 
-	local function finish(key)
-		local c = pending[key]
-		if not c then return nil end
-		pending[key] = nil
-		local set = frontierByY[c[2]]
-		if set then set[key] = nil end
-		return c
-	end
+	notify("Planting", ("Found %d valid spots."):format(#frontier))
 
-	local function confirm(key)
-		if not finish(key) then return end
-		local x, y, z = key:match(KEY_PATTERN)
-		for _, d in ipairs(DIRS) do
-			local nk = fmt(tonumber(x)+d[1], tonumber(y)+d[2], tonumber(z)+d[3])
-			local nc = pending[nk]
-			if nc then addFrontier(nk, nc) end
-		end
-	end
-
-	local function supporters(c, preferKey)
-		local list = {}
-		for _, d in ipairs(DIRS) do
-			local sk = fmt(c[1]+d[1], c[2]+d[2], c[3]+d[3])
-			local sb = occupied[sk]
-			if sb and sb.Parent then
-				local entry = { key = sk, normal = Vector3.new(-d[1], -d[2], -d[3]) }
-				if sk == preferKey then table.insert(list, 1, entry) else list[#list+1] = entry end
-			end
-		end
-		return list
-	end
-
-	local cx, cy, cz = sx, sy, sz
+	local cx, cy, cz = nil, nil, nil
 	local lastDx, lastDz = 0, 0
-	local curKey = seedKey
-
-	local function pickNext()
-		local activeY
-		for y, set in pairs(frontierByY) do
-			if next(set) ~= nil and (not activeY or y > activeY) then activeY = y end
-		end
-		if not activeY then return nil end
-		local set = frontierByY[activeY]
-
-		local bestKey, bestScore
-		if cy == activeY then
-			for _, d in ipairs(HORIZONTAL) do
-				local nk = fmt(cx + d[1], activeY, cz + d[2])
-				if set[nk] then
-					local open = 0
-					for _, e in ipairs(HORIZONTAL) do
-						if pending[fmt(cx+d[1]+e[1], activeY, cz+d[2]+e[2])] then open = open + 1 end
-					end
-					local score = open - ((d[1] == lastDx and d[2] == lastDz) and 0.5 or 0)
-					if not bestScore or score < bestScore then bestKey, bestScore = nk, score end
-				end
-			end
-		elseif cy - 1 == activeY and set[fmt(cx, activeY, cz)] then
-			bestKey = fmt(cx, activeY, cz)
-		end
-		if bestKey then return bestKey, set[bestKey] end
-
-		local nearestKey, nearestD
-		for key, c in pairs(set) do
-			local dx, dy, dz = c[1]-cx, c[2]-cy, c[3]-cz
-			local dist = dx*dx + dy*dy + dz*dz
-			if not nearestD or dist < nearestD then nearestKey, nearestD = key, dist end
-		end
-		return nearestKey, set[nearestKey]
-	end
-
 	local delay = CFG.PlaceDelay
-	local function placeOne(key, c)
-		local sups = supporters(c, curKey)
-		if #sups == 0 then return false end
-		for attempt = 1, CFG.MaxRetries + 1 do
-			if not Enabled or run ~= RunId then return false end
-			local sup = sups[((attempt - 1) % #sups) + 1]
-			local sb = occupied[sup.key]
-			if sb and sb.Parent then
-				if not glideAbove(blockPos(sb), attempt == 1 and CFG.HoverHeight or 2, run) then return false end
+
+	-- If we don't have a starting position, grab it from the player
+	local _, root = getChar()
+	if root then
+		local px, py, pz = root.Position.X, root.Position.Y, root.Position.Z
+		-- Find nearest valid spot
+		local nearestDist = math.huge
+		for _, c in ipairs(frontier) do
+			local d = (Vector3.new(c.x*4, c.y*4, c.z*4) - root.Position).Magnitude
+			if d < nearestDist then
+				nearestDist = d
+				cx, cy, cz = c.x, c.y, c.z
 			end
-			local normal = (attempt == 2) and FIXED_NORMAL or sup.normal
-			Remote:FireServer({ x = c[1], y = c[2], z = c[3] }, c[4], 0, normal, false, nil, false)
+		end
+	end
 
+	if not cx then return end
+
+	while Enabled and run == RunId and #frontier > 0 do
+		-- Find the best next target (snake logic)
+		local bestIdx, bestScore
+		for i, c in ipairs(frontier) do
+			if c.y == cy then
+				local open = 0
+				for _, d in ipairs(HORIZONTAL) do
+					local checkKey = fmt(c.x + d[1], c.y, c.z + d[2])
+					-- Check if this adjacent cell is also pending
+					if pending[checkKey] then open = open + 1 end
+				end
+				-- Prefer straight lines
+				local score = open - ((c.x - cx == lastDx and c.z - cz == lastDz) and 0.5 or 0)
+				if not bestScore or score < bestScore then bestIdx, bestScore = i, score end
+			end
+		end
+
+		-- Fallback to any pending if we can't find one on the same Y
+		if not bestIdx then
+			bestIdx = 1
+		end
+
+		local target = frontier[bestIdx]
+		table.remove(frontier, bestIdx)
+		pending[target.key] = nil
+		
+		local supportKey = fmt(target.x, target.y - 1, target.z)
+		local supportBlock = occupied[supportKey]
+
+		if supportBlock and supportBlock.Parent then
+			-- Glide to support
+			glideAbove(blockPos(supportBlock), CFG.HoverHeight, run)
+
+			-- Fire RequestPlace with the seed
+			local targetPos = { x = target.x, y = target.y, z = target.z }
+			Remote:FireServer(targetPos, CFG.SeedType, 0, FIXED_NORMAL, false, nil, false)
+
+			-- Wait for confirmation
 			local deadline = os.clock() + CFG.CheckTimeout
-			while not occupied[key] and os.clock() < deadline and Enabled and run == RunId do task.wait(0.03) end
-			if occupied[key] then return true end
-			delay = math.min(math.max(delay * 1.6, 0.15), CFG.MaxDelay)
+			while not occupied[target.key] and os.clock() < deadline and Enabled and run == RunId do task.wait(0.03) end
+			
+			if occupied[target.key] then
+				lastDx, lastDz = target.x - cx, target.z - cz
+				cx, cy, cz = target.x, target.y, target.z
+				delay = math.max(CFG.PlaceDelay, delay * 0.95)
+			else
+				delay = math.min(math.max(delay * 1.6, 0.15), CFG.MaxDelay)
+			end
+			task.wait(delay)
 		end
-		return false
 	end
-
-	while Enabled and run == RunId do
-		local key, c = pickNext()
-		if not key then break end
-		local ok = placeOne(key, c)
-		if not Enabled or run ~= RunId then return end
-
-		if ok then
-			if c[2] == cy then lastDx, lastDz = c[1]-cx, c[3]-cz end
-			confirm(key)
-			cx, cy, cz, curKey = c[1], c[2], c[3], key
-			local b = occupied[key]
-			if b and b.Parent then glideAbove(blockPos(b), CFG.HoverHeight, run) end
-			delay = math.max(CFG.PlaceDelay, delay * 0.95)
-		else
-			finish(key)
-		end
-		task.wait(delay)
-	end
+	notify("Planting Done", "Finished.")
 end
 
-local function runBuild(seedKey, run)
-	building = true
-	buildStart, buildEnd = os.clock(), math.huge
-	pcall(build, seedKey, run)
-	buildEnd = os.clock()
-	building = false
+local function runPlant(run)
+	pcall(plant, run)
 	stopHover()
-end
-
-local function onBlockAdded(block, run)
-	register(block)
-	local added = os.clock()
-	task.delay(0.15, function()
-		if not Enabled or run ~= RunId then return end
-		if building or (added >= buildStart and added <= buildEnd) then return end
-		local key = block:GetAttribute("CellKey")
-		if not key or not key:match(KEY_PATTERN) then return end
-		task.spawn(runBuild, key, run)
-	end)
 end
 
 local function disconnectAll()
@@ -326,22 +273,15 @@ end
 
 -- ===== UI =====
 Tab:CreateInput(dual({
-	name = "Radius (62 = ~12k blocks)",
-	currentValue = tostring(CFG.Radius),
+	name = "Seed ID",
+	currentValue = CFG.SeedType,
 	removeTextAfterFocusLost = false,
-	callback = function(text) CFG.Radius = tonumber(text) or 62 end,
-}))
-
-Tab:CreateInput(dual({
-	name = "Block Type",
-	currentValue = CFG.BlockType,
-	removeTextAfterFocusLost = false,
-	callback = function(text) CFG.BlockType = text end,
+	callback = function(text) CFG.SeedType = text end,
 }))
 
 Tab:CreateToggle(dual({
-	name = "Build Circle",
-	flag = "AutoBuilder",
+	name = "Plant Seeds (Snake Pattern)",
+	flag = "AutoPlanter",
 	currentValue = false,
 	callback = function(on)
 		Enabled = on
@@ -356,10 +296,9 @@ Tab:CreateToggle(dual({
 		for _, block in ipairs(BlocksFolder:GetChildren()) do register(block) end
 
 		local run = RunId
-		table.insert(conns, BlocksFolder.ChildAdded:Connect(function(block) onBlockAdded(block, run) end))
-		table.insert(conns, BlocksFolder.ChildRemoved:Connect(unregister))
-		notify("Builder Ready", "Place a block in the CENTER of the circle.")
+		table.insert(conns, BlocksFolder.ChildAdded:Connect(function(block) register(block) end))
+		task.spawn(runPlant, run)
 	end,
 }))
 
-Window:Notify(dual({ title = "VANTA Circle", content = "Loaded. Configure radius, then toggle.", duration = 5 }))
+Window:Notify(dual({ title = "VANTA Planter", content = "Loaded. Snake pattern enabled.", duration = 5 }))
