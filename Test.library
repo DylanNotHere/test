@@ -1,5 +1,5 @@
 -- ==================================================
--- VANTA | BERRY PLANTER (Snake Pattern + 8 Args)
+-- VANTA | BERRY PLANTER (Perfect Snake Pattern)
 -- ==================================================
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -36,8 +36,6 @@ local CFG = {
 
 local FIXED_NORMAL = Vector3.new(0, 1, 0)
 local KEY_PATTERN = "^(-?%d+),(-?%d+),(-?%d+)$"
-local DIRS = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} }
-local HORIZONTAL = { {1,0}, {-1,0}, {0,1}, {0,-1} }
 
 local function fmt(x, y, z) return string.format("%d,%d,%d", x, y, z) end
 local function notify(title, content) pcall(function() Window:Notify(dual({ title = title, content = content, duration = 4 })) end) end
@@ -125,7 +123,7 @@ local function glideAbove(pos, offset, run)
 	return glideActive(pos + Vector3.new(0, offset, 0), function() return Enabled and run == RunId end)
 end
 
--- ===== SNAKE PLANTER =====
+-- ===== PERFECT SNAKE PLANTER =====
 local function plant(run)
 	local Remote = RS:WaitForChild("Remotes"):WaitForChild("RequestPlace")
 	
@@ -144,84 +142,51 @@ local function plant(run)
 		return
 	end
 
-	-- Build a lookup table of the top layer grass
-	local validSupports = {}
+	-- Collect all valid targets
+	local targets = {}
 	for key, block in pairs(occupied) do
 		if block:GetAttribute("BlockId") == "GrassBlock" then
 			local x, y, z = key:match(KEY_PATTERN)
 			x, y, z = tonumber(x), tonumber(y), tonumber(z)
 			if y == maxY then
-				validSupports[key] = { x = x, y = y, z = z }
+				local targetKey = fmt(x, y + 1, z)
+				if not occupied[targetKey] then
+					table.insert(targets, { x = x, y = y + 1, z = z, key = targetKey, supportKey = key })
+				end
 			end
 		end
 	end
 
-	-- Setup snake frontier
-	local pending = {}
-	local frontier = {}
-	
-	for _, v in pairs(validSupports) do
-		local targetKey = fmt(v.x, v.y + 1, v.z)
-		if not occupied[targetKey] then
-			local c = { x = v.x, y = v.y + 1, z = v.z, key = targetKey }
-			pending[targetKey] = c
-			table.insert(frontier, c)
-		end
-	end
-
-	if #frontier == 0 then
+	if #targets == 0 then
 		notify("Error", "No valid spots to plant.")
 		return
 	end
 
-	notify("Planting", ("Found %d valid spots."):format(#frontier))
+	-- Sort into a perfect snake pattern
+	-- Group by Z, sort X ascending for even Z rows, descending for odd Z rows
+	table.sort(targets, function(a, b)
+		if a.z == b.z then
+			if a.z % 2 == 0 then
+				return a.x < b.x
+			else
+				return a.x > b.x
+			end
+		end
+		return a.z < b.z
+	end)
 
-	local cx, cy, cz = nil, nil, nil
-	local lastDx, lastDz = 0, 0
+	notify("Planting", ("Found %d valid spots."):format(#targets))
+
 	local delay = CFG.PlaceDelay
+	local placedCount = 0
 
-	-- Start at the nearest spot
-	local _, root = getChar()
-	if root then
-		local nearestDist = math.huge
-		for _, c in ipairs(frontier) do
-			local d = (Vector3.new(c.x*4, c.y*4, c.z*4) - root.Position).Magnitude
-			if d < nearestDist then
-				nearestDist = d
-				cx, cy, cz = c.x, c.y, c.z
-			end
-		end
-	end
-
-	if not cx then return end
-
-	while Enabled and run == RunId and #frontier > 0 do
-		-- Snake logic: Find best next target
-		local bestIdx, bestScore
-		for i, c in ipairs(frontier) do
-			if c.y == cy then
-				local open = 0
-				for _, d in ipairs(HORIZONTAL) do
-					if pending[fmt(c.x + d[1], c.y, c.z + d[2])] then open = open + 1 end
-				end
-				local score = open - ((c.x - cx == lastDx and c.z - cz == lastDz) and 0.5 or 0)
-				if not bestScore or score < bestScore then bestIdx, bestScore = i, score end
-			end
-		end
-
-		if not bestIdx then bestIdx = 1 end
-
-		local target = frontier[bestIdx]
-		table.remove(frontier, bestIdx)
-		pending[target.key] = nil
+	for _, target in ipairs(targets) do
+		if not Enabled or run ~= RunId then break end
 		
-		local supportKey = fmt(target.x, target.y - 1, target.z)
-		local supportBlock = occupied[supportKey]
-
+		local supportBlock = occupied[target.supportKey]
 		if supportBlock and supportBlock.Parent then
 			glideAbove(blockPos(supportBlock), CFG.HoverHeight, run)
 
-			-- THE FIX: Send all 8 arguments
 			local targetPos = { x = target.x, y = target.y, z = target.z }
 			Remote:FireServer(targetPos, CFG.SeedType, 0, FIXED_NORMAL, false, nil, false, 5)
 
@@ -229,8 +194,7 @@ local function plant(run)
 			while not occupied[target.key] and os.clock() < deadline and Enabled and run == RunId do task.wait(0.03) end
 			
 			if occupied[target.key] then
-				lastDx, lastDz = target.x - cx, target.z - cz
-				cx, cy, cz = target.x, target.y, target.z
+				placedCount = placedCount + 1
 				delay = math.max(CFG.PlaceDelay, delay * 0.95)
 			else
 				delay = math.min(math.max(delay * 1.6, 0.15), CFG.MaxDelay)
@@ -238,7 +202,7 @@ local function plant(run)
 			task.wait(delay)
 		end
 	end
-	notify("Planting Done", "Finished.")
+	notify("Planting Done", ("Placed %d seeds."):format(placedCount))
 end
 
 local function runPlant(run)
@@ -253,7 +217,7 @@ end
 
 -- ===== UI =====
 Tab:CreateToggle(dual({
-	name = "Plant Seeds (Snake Pattern)",
+	name = "Plant Seeds (Perfect Snake)",
 	flag = "AutoPlanter",
 	currentValue = false,
 	callback = function(on)
@@ -274,4 +238,4 @@ Tab:CreateToggle(dual({
 	end,
 }))
 
-Window:Notify(dual({ title = "VANTA Planter", content = "Loaded. 8 args enabled.", duration = 5 }))
+Window:Notify(dual({ title = "VANTA Planter", content = "Loaded. Perfect snake enabled.", duration = 5 }))
