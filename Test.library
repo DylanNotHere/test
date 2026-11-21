@@ -1,5 +1,5 @@
 -- ==================================================
--- VANTA | BERRY PLANTER (Perfect Snake Pattern)
+-- VANTA | BERRY PLANTER (Hardcoded Snake)
 -- ==================================================
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -25,35 +25,30 @@ local Window = Rayfield:CreateWindow(dual({
 local Tab = Window:CreateTab(dual({ name = "Planter" }))
 
 local CFG = {
-	SeedType = "BerryBushSeed", 
-	PlaceDelay = 0.04,
-	MaxDelay = 1.0,
-	CheckTimeout = 3,
-	MaxRetries = 4,
-	GlideSpeed = 45,
+	Spacing = 1,
+	PlantDelay = 0.15,
+	MaxDelay = 1.5,
+	ConfirmTimeout = 2,
+	MaxMisses = 4,
+	GlideSpeed = 30,
 	HoverHeight = 4,
 }
 
-local FIXED_NORMAL = Vector3.new(0, 1, 0)
 local KEY_PATTERN = "^(-?%d+),(-?%d+),(-?%d+)$"
-
 local function fmt(x, y, z) return string.format("%d,%d,%d", x, y, z) end
-local function notify(title, content) pcall(function() Window:Notify(dual({ title = title, content = content, duration = 4 })) end) end
+local function notify(title, content) pcall(function() Window:Notify(dual({ title = title, content = content, duration = 5 })) end) end
 
--- ===== STATE =====
+-- ===== state =====
 local Enabled = false
 local RunId = 0
 local BlocksFolder, occupied, blockKey, conns = nil, {}, {}, {}
 
-local function findBlocksFolder()
+local function findIsland()
 	local fallback
-	for _, island in ipairs(workspace:GetChildren()) do
-		if island.Name:match("^Island_") then
-			local blocks = island:FindFirstChild("Blocks")
-			if blocks then
-				if island.Name:find(tostring(player.UserId), 1, true) then return blocks end
-				fallback = fallback or blocks
-			end
+	for _, c in ipairs(workspace:GetChildren()) do
+		if c.Name:match("^Island_") and c:FindFirstChild("Blocks") then
+			if c.Name:find(tostring(player.UserId), 1, true) then return c end
+			fallback = fallback or c
 		end
 	end
 	return fallback
@@ -69,8 +64,15 @@ local function register(block)
 	task.delay(3, function() if conn.Connected then conn:Disconnect() end end)
 end
 
-local function blockPos(b) return b:IsA("BasePart") and b.Position or b:GetPivot().Position end
+local function unregister(block)
+	local key = blockKey[block]
+	if key then if occupied[key] == block then occupied[key] = nil end; blockKey[block] = nil end
+end
 
+local function blockPos(b) return b:IsA("BasePart") and b.Position or b:GetPivot().Position end
+local function parseKey(key) local x, y, z = key:match(KEY_PATTERN) return tonumber(x), tonumber(y), tonumber(z) end
+
+-- ===== glide engine =====
 local function getChar()
 	local char = player.Character
 	if not char then return end
@@ -88,9 +90,7 @@ local function startHover(hum, root)
 		if root.Parent then
 			root.CFrame = hoverCF
 			root.AssemblyLinearVelocity = Vector3.zero
-			if hum:GetState() == Enum.HumanoidStateType.Freefall then
-				hum:ChangeState(Enum.HumanoidStateType.Running)
-			end
+			if hum:GetState() == Enum.HumanoidStateType.Freefall then hum:ChangeState(Enum.HumanoidStateType.Running) end
 		end
 	end)
 end
@@ -102,11 +102,12 @@ local function stopHover()
 	if hum then hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true); hum:Move(Vector3.zero, false) end
 end
 
-local function glideActive(goal, active)
+local function glideAbove(pos, offset, run)
 	local hum, root = getChar()
 	if not hum then return false end
 	startHover(hum, root)
-	while active() do
+	local goal = pos + Vector3.new(0, offset, 0)
+	while Enabled and run == RunId do
 		if hum.Health <= 0 then return false end
 		local d = goal - hoverCF.Position
 		if d.Magnitude <= 0.75 then break end
@@ -119,95 +120,108 @@ local function glideActive(goal, active)
 	return true
 end
 
-local function glideAbove(pos, offset, run)
-	return glideActive(pos + Vector3.new(0, offset, 0), function() return Enabled and run == RunId end)
-end
+-- ===== planting =====
+local planting = false
 
--- ===== PERFECT SNAKE PLANTER =====
-local function plant(run)
-	local Remote = RS:WaitForChild("Remotes"):WaitForChild("RequestPlace")
-	
-	-- Find all GrassBlocks and determine top layer
+local function buildTargets()
+	-- Find the highest Y level of grass
 	local maxY = -math.huge
-	for key, block in pairs(occupied) do
-		if block:GetAttribute("BlockId") == "GrassBlock" then
-			local _, y = key:match(KEY_PATTERN)
-			y = tonumber(y)
+	for key, b in pairs(occupied) do
+		if b:GetAttribute("BlockId") == "GrassBlock" then
+			local _, y = parseKey(key)
 			if y > maxY then maxY = y end
 		end
 	end
+	if maxY == -math.huge then return {} end
 
-	if maxY == -math.huge then
-		notify("Error", "No GrassBlocks found on island.")
-		return
+	local rows = {}
+	for key, b in pairs(occupied) do
+		if b:GetAttribute("BlockId") == "GrassBlock" then
+			local x, y, z = parseKey(key)
+			if y == maxY then
+				rows[z] = rows[z] or {}
+				table.insert(rows[z], { x = x, z = z, block = b, key = fmt(x, y + 1, z) })
+			end
+		end
 	end
 
-	-- Collect all valid targets
+	local z_keys = {}
+	for z in pairs(rows) do table.insert(z_keys, z) end
+	table.sort(z_keys)
+
 	local targets = {}
-	for key, block in pairs(occupied) do
-		if block:GetAttribute("BlockId") == "GrassBlock" then
-			local x, y, z = key:match(KEY_PATTERN)
-			x, y, z = tonumber(x), tonumber(y), tonumber(z)
-			if y == maxY then
-				local targetKey = fmt(x, y + 1, z)
-				if not occupied[targetKey] then
-					table.insert(targets, { x = x, y = y + 1, z = z, key = targetKey, supportKey = key })
+	local Spacing = math.max(1, math.floor(CFG.Spacing))
+	
+	for n, z in ipairs(z_keys) do
+		local row = rows[z]
+		table.sort(row, function(a, b)
+			if n % 2 == 1 then return a.x < b.x else return a.x > b.x end
+		end)
+		
+		for _, t in ipairs(row) do
+			-- Apply spacing
+			if (t.x % Spacing == 0) and (t.z % Spacing == 0) then
+				-- Only plant if there's nothing there
+				if not occupied[t.key] then
+					table.insert(targets, t)
 				end
 			end
 		end
 	end
+	return targets
+end
 
-	if #targets == 0 then
-		notify("Error", "No valid spots to plant.")
-		return
-	end
+local function plantAll(run)
+	planting = true
+	local Remote = RS:WaitForChild("Remotes"):WaitForChild("RequestPlace")
+	local targets = buildTargets()
+	
+	print(("[Planter] %d spots to plant"):format(#targets))
+	notify("Planting", ("%d spots"):format(#targets))
 
-	-- Sort into a perfect snake pattern
-	-- Group by Z, sort X ascending for even Z rows, descending for odd Z rows
-	table.sort(targets, function(a, b)
-		if a.z == b.z then
-			if a.z % 2 == 0 then
-				return a.x < b.x
-			else
-				return a.x > b.x
-			end
-		end
-		return a.z < b.z
-	end)
+	local delay = CFG.PlantDelay
+	local planted, misses = 0, 0
 
-	notify("Planting", ("Found %d valid spots."):format(#targets))
-
-	local delay = CFG.PlaceDelay
-	local placedCount = 0
-
-	for _, target in ipairs(targets) do
+	for _, t in ipairs(targets) do
 		if not Enabled or run ~= RunId then break end
 		
-		local supportBlock = occupied[target.supportKey]
-		if supportBlock and supportBlock.Parent then
-			glideAbove(blockPos(supportBlock), CFG.HoverHeight, run)
+		if t.block.Parent then
+			glideAbove(blockPos(t.block), CFG.HoverHeight, run)
 
-			local targetPos = { x = target.x, y = target.y, z = target.z }
-			Remote:FireServer(targetPos, CFG.SeedType, 0, FIXED_NORMAL, false, nil, false, 5)
-
-			local deadline = os.clock() + CFG.CheckTimeout
-			while not occupied[target.key] and os.clock() < deadline and Enabled and run == RunId do task.wait(0.03) end
+			-- HARDCODED FROM COBALT DUMP
+			local targetPos = { x = t.x, y = t.block.Position.Y / 4 + 1, z = t.z }
+			-- (Using the block's grid Y + 1 for the seed height)
+			local _, by, _ = parseKey(t.block:GetAttribute("CellKey"))
 			
-			if occupied[target.key] then
-				placedCount = placedCount + 1
-				delay = math.max(CFG.PlaceDelay, delay * 0.95)
+			Remote:FireServer({ x = t.x, y = by + 1, z = t.z }, "BerryBushSeed", 0, Vector3.new(0,1,0), false, nil, false, 5)
+
+			-- Wait for the bush to appear (block above becomes occupied)
+			local deadline = os.clock() + CFG.ConfirmTimeout
+			local ok = false
+			while os.clock() < deadline and Enabled and run == RunId do
+				if occupied[t.key] then ok = true break end
+				task.wait(0.03)
+			end
+
+			if ok then
+				planted += 1
+				misses = 0
+				delay = math.max(CFG.PlantDelay, delay * 0.95)
 			else
-				delay = math.min(math.max(delay * 1.6, 0.15), CFG.MaxDelay)
+				misses += 1
+				delay = math.min(delay * 1.6 + 0.05, CFG.MaxDelay)
+				if misses >= CFG.MaxMisses then
+					notify("Stopped", "Plants aren't confirming. Server might be rejecting placements.")
+					break
+				end
 			end
 			task.wait(delay)
 		end
 	end
-	notify("Planting Done", ("Placed %d seeds."):format(placedCount))
-end
 
-local function runPlant(run)
-	pcall(plant, run)
+	print(("[Planter] done: %d planted"):format(planted))
 	stopHover()
+	planting = false
 end
 
 local function disconnectAll()
@@ -215,27 +229,58 @@ local function disconnectAll()
 	conns = {}
 end
 
+local function arm()
+	local island = findIsland()
+	BlocksFolder = island and island:FindFirstChild("Blocks")
+	if not BlocksFolder then warn("Couldn't find Blocks folder"); return false end
+
+	occupied, blockKey = {}, {}
+	for _, b in ipairs(BlocksFolder:GetChildren()) do register(b) end
+
+	table.insert(conns, BlocksFolder.ChildAdded:Connect(register))
+	table.insert(conns, BlocksFolder.ChildRemoved:Connect(unregister))
+	return true
+end
+
 -- ===== UI =====
 Tab:CreateToggle(dual({
-	name = "Plant Seeds (Perfect Snake)",
-	flag = "AutoPlanter",
+	name = "Auto Plant",
+	flag = "AutoPlant",
 	currentValue = false,
 	callback = function(on)
 		Enabled = on
 		RunId += 1
 		disconnectAll()
-		if not on then stopHover(); return end
-		
-		BlocksFolder = findBlocksFolder()
-		if not BlocksFolder then notify("Error", "No island found."); return end
 
-		occupied, blockKey = {}, {}
-		for _, block in ipairs(BlocksFolder:GetChildren()) do register(block) end
+		if not on then
+			notify("Auto Plant off", "Stopped.")
+			return
+		end
 
-		local run = RunId
-		table.insert(conns, BlocksFolder.ChildAdded:Connect(function(block) register(block) end))
-		task.spawn(runPlant, run)
+		if not arm() then return end
+		notify("Auto Plant on", "Planting snake pattern...")
+		task.spawn(plantAll, RunId)
 	end,
 }))
 
-Window:Notify(dual({ title = "VANTA Planter", content = "Loaded. Perfect snake enabled.", duration = 5 }))
+Tab:CreateSlider(dual({
+	name = "Spacing (1 = every block)",
+	flag = "PlantSpacing",
+	range = { 1, 5 },
+	increment = 1,
+	suffix = " blocks",
+	currentValue = CFG.Spacing,
+	callback = function(v) CFG.Spacing = math.floor(v) end,
+}))
+
+Tab:CreateSlider(dual({
+	name = "Plant Delay",
+	flag = "PlantDelay",
+	range = { 0.03, 1 },
+	increment = 0.01,
+	suffix = " s",
+	currentValue = CFG.PlantDelay,
+	callback = function(v) CFG.PlantDelay = v end,
+}))
+
+Window:Notify(dual({ title = "VANTA Planter", content = "Loaded. Toggle to start.", duration = 5 }))
