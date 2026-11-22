@@ -62,7 +62,7 @@ do
     local bossNames = { Morten = true }
 
     local blockedSpots = {
-        { Vector3.new(8, 196, -80), 5 },
+        { Vector3.new(55.714, 213.533, -128.022), 5 },
         { Vector3.new(24, 192, -112), 5 },
         { Vector3.new(9, -198.5, 0), 5 },
         { Vector3.new(56.069557189941406, 208.0669403076172, -127.90524291992188), 8 },
