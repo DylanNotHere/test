@@ -1,8 +1,18 @@
+
 --==================================================
--- VANTA | AUTO POLLINATION v2.0 (simple)
--- No FlowerId / colour matching any more.
--- Finds every "Snapdragon Flower" on your island, pairs each one with the nearest other Snapdragon Flower
--- within 2 cells, then: teleport next to the pair -> pollinate both -> teleport to the next pair.
+-- VANTA | AUTO POLLINATION v2.1
+--
+-- ORIGINAL v2.0 PAIRING + TELEPORT PRESERVED
+--
+-- NEW:
+-- 1. Records existing Snapdragon Flowers.
+-- 2. Pollinates all discovered pairs.
+-- 3. Detects newly spawned Snapdragon Flowers.
+-- 4. Teleports to and harvests the offspring.
+-- 5. Returns to the last parent pair and pollinates again.
+--
+-- HARVEST:
+-- RequestHarvest:FireServer(Offspring.HB)
 --==================================================
 
 local Players = game:GetService("Players")
@@ -13,23 +23,28 @@ local Remotes = ReplicatedStorage:WaitForChild("Remotes")
 
 local HoldRemote = Remotes:WaitForChild("RequestHoldBlock")
 local PollinateRemote = Remotes:WaitForChild("RequestPollinate")
+local HarvestRemote = Remotes:WaitForChild("RequestHarvest")
 
 --==================================================
 -- CONFIGURATION
 --==================================================
 
 local CFG = {
-    FlowerName = "snapdragonflower", -- compared lower-case with spaces removed, so "Snapdragon Flower" works too
-    GridSize = 4,                    -- studs per cell
-    MaxCells = 2,                    -- a pair = two flowers at most this many cells apart
+    FlowerName = "snapdragonflower",
+
+    GridSize = 4,
+    MaxCells = 2,
     HeightTolerance = 2,
 
     TeleportHeight = 3,
-    TeleportDelay = 0.12,            -- wait after each teleport
-    PollinationDelay = 0.2,          -- wait after each pollination
+    TeleportDelay = 0.12,
+    PollinationDelay = 0.2,
 
-    Loop = true,                     -- go round again when every pair is done
-    LoopDelay = 3,
+    OffspringScanDelay = 1,
+    OffspringTimeout = 300,
+    HarvestDelay = 0.4,
+
+    Loop = true,
 }
 
 --==================================================
@@ -38,7 +53,16 @@ local CFG = {
 
 local Running = false
 local Equipped = false
-local Stats = { Pairs = 0, Done = 0, Rounds = 0 }
+
+local Stats = {
+    Pairs = 0,
+    Done = 0,
+    Harvested = 0,
+    Rounds = 0,
+}
+
+local SeenFlowers = {}
+local LastPair = nil
 
 --==================================================
 -- RAYFIELD
@@ -60,14 +84,22 @@ local SettingsTab = Window:CreateTab("Settings")
 MainTab:CreateSection("Automation")
 
 local StatusLabel = MainTab:CreateLabel("Status: Idle")
-local StatsLabel = MainTab:CreateLabel("Pairs: 0 | Pollinated: 0 | Rounds: 0")
+local StatsLabel = MainTab:CreateLabel(
+    "Pairs: 0 | Pollinated: 0 | Harvested: 0"
+)
 
 local function UpdateStatus(Message)
     StatusLabel:Set("Status: " .. Message)
 end
 
 local function UpdateStats()
-    StatsLabel:Set(("Pairs: %d | Pollinated: %d | Rounds: %d"):format(Stats.Pairs, Stats.Done, Stats.Rounds))
+    StatsLabel:Set(
+        ("Pairs: %d | Pollinated: %d | Harvested: %d"):format(
+            Stats.Pairs,
+            Stats.Done,
+            Stats.Harvested
+        )
+    )
 end
 
 --==================================================
@@ -106,7 +138,12 @@ local function TeleportTo(Position)
         return false
     end
 
-    Root.CFrame = CFrame.new(Position.X, Position.Y + CFG.TeleportHeight, Position.Z)
+    Root.CFrame = CFrame.new(
+        Position.X,
+        Position.Y + CFG.TeleportHeight,
+        Position.Z
+    )
+
     Root.AssemblyLinearVelocity = Vector3.zero
 
     task.wait(CFG.TeleportDelay)
@@ -115,7 +152,7 @@ local function TeleportTo(Position)
 end
 
 --==================================================
--- ISLAND (the one you're standing next to; works on co-op islands too)
+-- ISLAND
 --==================================================
 
 local function GetNodes()
@@ -138,10 +175,12 @@ local function GetNodes()
                         local HB = Kids[Index]:FindFirstChild("HB")
 
                         if HB and HB:IsA("BasePart") then
-                            local Distance = (HB.Position - Root.Position).Magnitude
+                            local Distance =
+                                (HB.Position - Root.Position).Magnitude
 
                             if not BestDistance or Distance < BestDistance then
-                                Best, BestDistance = Nodes, Distance
+                                Best = Nodes
+                                BestDistance = Distance
                             end
                         end
                     end
@@ -154,7 +193,7 @@ local function GetNodes()
 end
 
 --==================================================
--- FIND PAIRS
+-- FLOWER DETECTION
 --==================================================
 
 local function IsSnapdragon(Model)
@@ -165,21 +204,55 @@ local function IsSnapdragon(Model)
     return Model.Name:lower():gsub("%s+", "") == CFG.FlowerName
 end
 
-local function FindPairs(Nodes)
-    -- every snapdragon on the island
+local function GetFlowerHB(Model)
+    local HB = Model:FindFirstChild("HB", true)
+
+    if HB and HB:IsA("BasePart") then
+        return HB
+    end
+
+    return nil
+end
+
+local function GetFlowers(Nodes)
     local Flowers = {}
 
     for _, Object in ipairs(Nodes:GetDescendants()) do
         if IsSnapdragon(Object) then
-            local HB = Object:FindFirstChild("HB", true)
+            local HB = GetFlowerHB(Object)
 
-            if HB and HB:IsA("BasePart") then
-                Flowers[#Flowers + 1] = { Model = Object, HB = HB, Position = HB.Position }
+            if HB then
+                table.insert(Flowers, {
+                    Model = Object,
+                    HB = HB,
+                    Position = HB.Position,
+                })
             end
         end
     end
 
-    -- pair each flower with the nearest unused one within MaxCells (in X and Z)
+    return Flowers
+end
+
+--==================================================
+-- RECORD EXISTING FLOWERS
+--==================================================
+
+local function RecordExistingFlowers(Nodes)
+    table.clear(SeenFlowers)
+
+    for _, Flower in ipairs(GetFlowers(Nodes)) do
+        SeenFlowers[Flower.Model] = true
+    end
+end
+
+--==================================================
+-- FIND PAIRS (ORIGINAL v2.0)
+--==================================================
+
+local function FindPairs(Nodes)
+    local Flowers = GetFlowers(Nodes)
+
     local Reach = CFG.GridSize * CFG.MaxCells + 0.6
     local Used = {}
     local Pairs = {}
@@ -194,11 +267,16 @@ local function FindPairs(Nodes)
                     local DZ = math.abs(A.Position.Z - B.Position.Z)
                     local DY = math.abs(A.Position.Y - B.Position.Y)
 
-                    if DX <= Reach and DZ <= Reach and DY <= CFG.HeightTolerance then
+                    if DX <= Reach
+                    and DZ <= Reach
+                    and DY <= CFG.HeightTolerance then
+
                         local Distance = DX * DX + DZ * DZ
 
-                        if Distance > 0 and (not BestDistance or Distance < BestDistance) then
-                            Best, BestDistance = B, Distance
+                        if Distance > 0
+                        and (not BestDistance or Distance < BestDistance) then
+                            Best = B
+                            BestDistance = Distance
                         end
                     end
                 end
@@ -217,7 +295,6 @@ local function FindPairs(Nodes)
         end
     end
 
-    -- visit them in a sensible order: always go to the closest pair next
     local Ordered = {}
     local Current = nil
 
@@ -225,15 +302,19 @@ local function FindPairs(Nodes)
         local BestIndex, BestDistance = 1, nil
 
         for Index, Pair in ipairs(Pairs) do
-            local Distance = Current and (Pair.Spot - Current).Magnitude or Pair.Spot.Magnitude
+            local Distance =
+                Current and (Pair.Spot - Current).Magnitude
+                or Pair.Spot.Magnitude
 
             if not BestDistance or Distance < BestDistance then
-                BestIndex, BestDistance = Index, Distance
+                BestIndex = Index
+                BestDistance = Distance
             end
         end
 
         local Pair = table.remove(Pairs, BestIndex)
-        Ordered[#Ordered + 1] = Pair
+
+        table.insert(Ordered, Pair)
         Current = Pair.Spot
     end
 
@@ -241,18 +322,28 @@ local function FindPairs(Nodes)
 end
 
 --==================================================
--- POLLINATE
+-- EQUIP
 --==================================================
 
 local function EquipPollinator()
     HoldRemote:FireServer("Pollinator")
+
     task.wait(CFG.PollinationDelay)
+
     Equipped = true
 end
 
+--==================================================
+-- POLLINATE
+--==================================================
+
 local function PollinatePair(Pair)
-    if not (Pair.A.Model.Parent and Pair.B.Model.Parent and Pair.A.HB.Parent and Pair.B.HB.Parent) then
-        return false -- one of them is gone
+    if not Pair
+    or not Pair.A.Model.Parent
+    or not Pair.B.Model.Parent
+    or not Pair.A.HB.Parent
+    or not Pair.B.HB.Parent then
+        return false
     end
 
     if not TeleportTo(Pair.Spot) then
@@ -272,60 +363,175 @@ local function PollinatePair(Pair)
 end
 
 --==================================================
+-- FIND NEW OFFSPRING
+--==================================================
+
+local function FindNewOffspring(Nodes)
+    for _, Flower in ipairs(GetFlowers(Nodes)) do
+        if not SeenFlowers[Flower.Model] then
+            SeenFlowers[Flower.Model] = true
+            return Flower
+        end
+    end
+
+    return nil
+end
+
+--==================================================
+-- WAIT FOR OFFSPRING
+--==================================================
+
+local function WaitForOffspring(Nodes)
+    local Started = os.clock()
+
+    UpdateStatus("Waiting for offspring...")
+
+    while Running do
+        local NewFlower = FindNewOffspring(Nodes)
+
+        if NewFlower then
+            return NewFlower
+        end
+
+        if CFG.OffspringTimeout > 0
+        and os.clock() - Started >= CFG.OffspringTimeout then
+            return nil
+        end
+
+        task.wait(CFG.OffspringScanDelay)
+    end
+
+    return nil
+end
+
+--==================================================
+-- HARVEST OFFSPRING
+--==================================================
+
+local function HarvestOffspring(Flower)
+    if not Flower
+    or not Flower.Model
+    or not Flower.Model.Parent then
+        return false
+    end
+
+    local HB = GetFlowerHB(Flower.Model)
+
+    if not HB then
+        return false
+    end
+
+    UpdateStatus("Harvesting offspring...")
+
+    if not TeleportTo(HB.Position) then
+        return false
+    end
+
+    task.wait(CFG.HarvestDelay)
+
+    HarvestRemote:FireServer(HB)
+
+    task.wait(CFG.HarvestDelay)
+
+    Stats.Harvested += 1
+    UpdateStats()
+
+    return true
+end
+
+--==================================================
 -- MAIN LOOP
 --==================================================
 
 local function Run()
-    while Running do
-        local Nodes = GetNodes()
+    local Nodes = GetNodes()
 
-        if not Nodes then
-            UpdateStatus("Island or Nodes not found")
+    if not Nodes then
+        UpdateStatus("Island or Nodes not found")
+        Running = false
+        return
+    end
+
+    -- Record parents before any pollination happens.
+    RecordExistingFlowers(Nodes)
+
+    UpdateStatus("Scanning pairs...")
+
+    local Pairs = FindPairs(Nodes)
+
+    Stats.Pairs = #Pairs
+    Stats.Rounds = 1
+    UpdateStats()
+
+    if #Pairs == 0 then
+        UpdateStatus("No Snapdragon pairs found")
+        Running = false
+        return
+    end
+
+    if not Equipped then
+        if not WaitForRoot() then
+            Running = false
+            return
+        end
+
+        EquipPollinator()
+    end
+
+    -- Initial pass: pollinate every discovered pair.
+    for Index, Pair in ipairs(Pairs) do
+        if not Running then
             break
         end
 
-        UpdateStatus("Scanning...")
-
-        local Pairs = FindPairs(Nodes)
-
-        Stats.Pairs = #Pairs
-        Stats.Rounds += 1
-        UpdateStats()
-
-        if #Pairs == 0 then
-            UpdateStatus("No Snapdragon pairs found")
-            break
-        end
+        UpdateStatus(("Pollinating pair %d/%d"):format(Index, #Pairs))
 
         if not Equipped then
-            WaitForRoot()
             EquipPollinator()
         end
 
-        for Index, Pair in ipairs(Pairs) do
-            if not Running then break end
-
-            UpdateStatus(("Pair %d/%d"):format(Index, #Pairs))
-
-            if not Equipped then
-                EquipPollinator()
-            end
-
-            PollinatePair(Pair)
+        if PollinatePair(Pair) then
+            LastPair = Pair
         end
+    end
 
-        if not (Running and CFG.Loop) then
+    -- Continuous offspring cycle.
+    while Running and CFG.Loop do
+        if not Nodes.Parent then
+            UpdateStatus("Island unavailable")
             break
         end
 
-        UpdateStatus("Round done, waiting...")
-        task.wait(CFG.LoopDelay)
+        local Offspring = WaitForOffspring(Nodes)
+
+        if not Running then
+            break
+        end
+
+        if not Offspring then
+            UpdateStatus("Offspring wait timed out")
+            break
+        end
+
+        if HarvestOffspring(Offspring) then
+            -- Return to the last pair that was pollinated.
+            if LastPair then
+                UpdateStatus("Returning to parent pair...")
+
+                if not Equipped then
+                    EquipPollinator()
+                end
+
+                if PollinatePair(LastPair) then
+                    Stats.Rounds += 1
+                    UpdateStats()
+                end
+            end
+        end
     end
 
-    if Running then
-        Running = false
-        UpdateStatus("Done")
-    end
+    Running = false
+    UpdateStatus("Done")
 end
 
 --==================================================
@@ -339,12 +545,19 @@ MainTab:CreateToggle({
 
     Callback = function(Value)
         if Value then
-            if Running then return end
+            if Running then
+                return
+            end
 
             Running = true
             Equipped = false
+            LastPair = nil
+
+            Stats.Pairs = 0
             Stats.Done = 0
+            Stats.Harvested = 0
             Stats.Rounds = 0
+
             UpdateStats()
 
             task.spawn(Run)
@@ -356,7 +569,7 @@ MainTab:CreateToggle({
 })
 
 MainTab:CreateToggle({
-    Name = "Loop (go round again when finished)",
+    Name = "Loop / Auto Offspring",
     CurrentValue = CFG.Loop,
     Flag = "VANTA_Loop",
 
@@ -367,7 +580,7 @@ MainTab:CreateToggle({
 
 SettingsTab:CreateSlider({
     Name = "Pair distance (cells)",
-    Range = { 1, 4 },
+    Range = {1, 4},
     Increment = 1,
     Suffix = " cells",
     CurrentValue = CFG.MaxCells,
@@ -380,7 +593,7 @@ SettingsTab:CreateSlider({
 
 SettingsTab:CreateSlider({
     Name = "Grid Size",
-    Range = { 2, 12 },
+    Range = {2, 12},
     Increment = 1,
     Suffix = " studs",
     CurrentValue = CFG.GridSize,
@@ -393,7 +606,7 @@ SettingsTab:CreateSlider({
 
 SettingsTab:CreateSlider({
     Name = "Teleport Height",
-    Range = { 2, 10 },
+    Range = {2, 10},
     Increment = 1,
     Suffix = " studs",
     CurrentValue = CFG.TeleportHeight,
@@ -406,7 +619,7 @@ SettingsTab:CreateSlider({
 
 SettingsTab:CreateSlider({
     Name = "Pollination Delay",
-    Range = { 0.05, 2 },
+    Range = {0.05, 2},
     Increment = 0.05,
     Suffix = " seconds",
     CurrentValue = CFG.PollinationDelay,
@@ -419,7 +632,7 @@ SettingsTab:CreateSlider({
 
 SettingsTab:CreateSlider({
     Name = "Teleport Delay",
-    Range = { 0.05, 1 },
+    Range = {0.05, 1},
     Increment = 0.05,
     Suffix = " seconds",
     CurrentValue = CFG.TeleportDelay,
@@ -431,12 +644,12 @@ SettingsTab:CreateSlider({
 })
 
 Player.CharacterAdded:Connect(function()
-    Equipped = false -- re-equips the pollinator after a respawn
+    Equipped = false
 end)
 
 Rayfield:Notify({
     Title = "VANTA",
-    Content = "Auto Pollination v2.0 loaded.",
+    Content = "Auto Pollination v2.1 loaded.",
     Duration = 5,
 })
 
